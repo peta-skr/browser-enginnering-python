@@ -93,6 +93,14 @@ class URL:
             # パス絶対URL（/path/...）にホスト・スキームを補完
             return URL(self.scheme + "://" + self.host + \
                        ":" + str(self.port) + url)
+        
+    def __str__(self):
+        port_part = ":" + str(self.port)
+        if self.scheme == "https" and self.port == 443:
+            port_part = ""
+        if self.scheme == "http" and self.port == 80:
+            port_part = ""
+        return self.scheme + "://" + self.host + port_part + self.path
 
 
 # フォントオブジェクトのキャッシュ（サイズ・ウェイト・スタイルをキーとする）
@@ -141,19 +149,21 @@ class BlockLayout:
         self.display_list = []    # インラインモード時の描画情報（x, y, word, font, color）のリスト
 
     def word(self, node, word):
-        """1単語を行バッファに追加する。行幅を超える場合はフラッシュして次の行へ折り返す"""
+        """1単語を行バッファに追加する。行幅を超える場合は新しい行へ折り返してから追加する"""
         weight = node.style["font-weight"]
         style = node.style["font-style"]
         if style == "normal": style = "roman"
         size = int(float(node.style["font-size"][:-2]) * .75)
         font = get_font(size, weight, style)
         w = font.measure(word)
-        color = node.style["color"]
 
         if self.cursor_x + w > self.width:
-            self.flush()
+            self.new_line()
 
-        self.line.append((self.cursor_x, word, font, color))
+        line = self.children[-1]
+        previous_word = line.children[-1] if line.children else None
+        text = TextLayout(node, word, line, previous_word)
+        line.children.append(text)
         self.cursor_x += w + font.measure(" ")
 
     def flush(self):
@@ -183,7 +193,7 @@ class BlockLayout:
                 self.word(node, word)
         else:
             if node.tag == "br":
-                self.flush()
+                self.new_line()
             for child in node.children:
                 self.recurse(child)
 
@@ -230,38 +240,41 @@ class BlockLayout:
         else:
             # インラインモード: テキストを単語単位で行バッファに積む
             self.cursor_x = 0
-            self.cursor_y = 0
-            self.line = []
+            # self.cursor_y = 0
+            # self.line = []
+            self.new_line()
             self.recurse(self.node)
-            self.flush()
+            # self.flush()
 
         # 子レイアウトを再帰的に確定
         for child in self.children:
             child.layout()
 
         # 高さの集計
-        if mode == "block":
-            self.height = sum([child.height for child in self.children])
-        else:
-            self.height = self.cursor_y
+        self.height = sum([child.height for child in self.children])
+
+    def self_rect(self):
+        return Rect(self.x, self.y,
+                    self.x + self.width, self.y + self.height)
 
     def paint(self):
         """描画コマンドリストを返す。
-        背景色（background-color）が設定されていればDrawRectを追加し、
-        インラインモードの場合はdisplay_listの各単語をDrawTextとして追加する。"""
+        背景色（background-color）が設定されていればDrawRectを追加する。"""
         cmds = []
 
         if isinstance(self.node, Element):
             bgcolor = self.node.style.get("background-color", "transparent")
             if bgcolor != "transparent":
-                x2, y2 = self.x + self.width, self.y + self.height
-                rect = DrawRect(self.x, self.y, x2, y2, bgcolor)
+                rect = DrawRect(self.x, self.y, self.x + self.width, self.y + self.height, bgcolor)
                 cmds.append(rect)
 
-        if self.layout_mode() == "inline":
-            for x, y, word, font, color in self.display_list:
-                cmds.append(DrawText(x, y, word, font, color))
         return cmds
+    
+    def new_line(self):
+        self.cursor_x = 0
+        last_line = self.children[-1] if self.children else None
+        new_line = LineLayout(self.node, self, last_line)
+        self.children.append(new_line)
 
 
 class DocumentLayout:
@@ -479,6 +492,7 @@ class DrawRect:
         )
 
 
+# 親ノードから子ノードへ継承されるCSSプロパティとそのデフォルト値
 INHERITED_PROPERTIES = {
     "font-size": "16px",
     "font-style": "normal",
@@ -620,6 +634,84 @@ class DescendantSelector:
             node = node.parent
         return False
 
+class LineLayout:
+    """インラインモードの1行分を表すレイアウトオブジェクト。
+    子要素としてTextLayoutを持ち、ベースライン揃えで単語を配置する。"""
+
+    def __init__(self, node, parent, previous):
+        self.node = node          # 対応するHTMLノード
+        self.parent = parent      # 親BlockLayout
+        self.previous = previous  # 直前の行（y座標計算に使用）
+        self.children = []        # この行に含まれるTextLayoutのリスト
+
+    def layout(self):
+        """行の座標・高さを確定する。各単語のy座標をベースライン基準で揃える。"""
+        self.width = self.parent.width
+        self.x = self.parent.x
+
+        # y座標: 前の行の直後、または親の先頭
+        if self.previous:
+            self.y = self.previous.y + self.previous.height
+        else:
+            self.y = self.parent.y
+
+        # 各単語（TextLayout）のレイアウトを確定
+        for word in self.children:
+            word.layout()
+
+        # 空行の場合は高さ0で終了
+        if not self.children:
+            self.height = 0
+            return
+
+        # ベースライン揃え: 全単語のascentの最大値を基準にy座標を調整
+        max_ascent = max([word.font.metrics("ascent") for word in self.children])
+        baseline = self.y + 1.25 * max_ascent
+        for word in self.children:
+            word.y = baseline - word.font.metrics("ascent")
+        max_descent = max([word.font.metrics("descent") for word in self.children])
+        self.height = 1.25 * (max_ascent + max_descent)
+
+    def paint(self):
+        # 行自体は描画コマンドを持たない（子のTextLayoutが描画を担当）
+        return []
+
+class TextLayout:
+    """1単語分のレイアウトオブジェクト。フォント・座標・サイズを計算し、
+    DrawTextコマンドを生成する最小描画単位。"""
+
+    def __init__(self, node, word, parent, previous):
+        self.node = node          # 対応するHTMLテキストノード
+        self.word = word          # この単語の文字列
+        self.children = []        # 葉ノードのため常に空
+        self.parent = parent      # 親LineLayout
+        self.previous = previous  # 同じ行内の直前の単語（x座標計算に使用）
+
+    def layout(self):
+        """フォントを決定し、x座標・幅・高さを計算する。
+        y座標はLineLayout.layout()でベースライン揃え後に設定される。"""
+        weight = self.node.style["font-weight"]
+        style = self.node.style["font-style"]
+        if style == "normal": style = "roman"  # tkinterでは"roman"が通常体
+        size = int(float(self.node.style["font-size"][:-2]) * .75)  # px→pt変換（概算）
+        self.font = get_font(size, weight, style)
+
+        self.width = self.font.measure(self.word)
+
+        # x座標: 前の単語の右端＋スペース幅、なければ行の先頭
+        if self.previous:
+            space = self.previous.font.measure(" ")
+            self.x = self.previous.x + space + self.previous.width
+        else:
+            self.x = self.parent.x
+
+        self.height = self.font.metrics("linespace")
+
+    def paint(self):
+        """この単語のDrawTextコマンドを返す"""
+        color = self.node.style["color"]
+        return [DrawText(self.x, self.y, self.word, self.font, color)]
+
 
 def style(node, rules):
     """CSSルールと継承プロパティをノードに適用し、子ノードへ再帰する。
@@ -688,28 +780,24 @@ def cascade_priority(rule):
     return selector.priority
 
 
+# ブラウザのデフォルトスタイルシート（browser.cssから読み込み、起動時に1回だけパース）
 DEFAULT_STYLE_SHEET = CSSParser(open("browser.css").read()).parse()
 
 
-class Browser:
+class Tab:
     """ブラウザのメインクラス。ウィンドウ・キャンバス・スクロール状態を管理し、
     URLの読み込みからレンダリングまでのパイプラインを統括する。"""
 
-    def __init__(self):
-        # tkinterウィンドウとキャンバスを初期化
-        self.window = tkinter.Tk()
-        self.canvas = tkinter.Canvas(
-            self.window,
-            width=WIDTH,
-            height=HEIGHT,
-            bg="white"
-        )
-        self.canvas.pack()
-        self.scroll = 0  # 現在のスクロール位置（ピクセル）
-        self.window.bind("<Down>", self.scrolldown)  # 下矢印キーにスクロールを割り当て
+    def __init__(self, tab_height):
+        self.url = None
+        self.scroll = 0
+        self.tab_height = tab_height
+        self.history = []
 
     def load(self, url):
         """URLからHTMLを取得し、パース・スタイル適用・レイアウト・描画を行う"""
+        self.history.append(url)
+        self.url = url
         body = url.request()
         self.nodes = HTMLParser(body).parse()
 
@@ -740,26 +828,328 @@ class Browser:
 
         self.display_list = []
         paint_tree(self.document, self.display_list)
+
+    def draw(self, canvas, offset):
+        """display_listの描画コマンドをキャンバスに描画する。
+        現在のビューポート（scroll〜scroll+HEIGHT）外のコマンドはスキップして高速化する。"""
+        for cmd in self.display_list:
+            if cmd.top > self.scroll + self.tab_height: continue  # 画面下より下は描画しない
+            if cmd.bottom < self.scroll: continue        # 画面上より上は描画しない
+            cmd.execute(self.scroll - offset, canvas)
+
+    def scrolldown(self):
+        """スクロール位置を1ステップ下へ更新する。ページ末尾を超えないようにクランプする。"""
+        max_y = max(
+            self.document.height + 2*VSTEP - self.tab_height, 0)
+        self.scroll = min(self.scroll + SCROLL_STEP, max_y)
+
+    def click(self, x, y):
+        """クリック座標にあるレイアウトオブジェクトを特定し、
+        リンク（<a>タグ）であればそのhrefを読み込む。"""
+        y += self.scroll  # スクロールを考慮した絶対座標に変換
+
+        # クリック座標に重なるレイアウトオブジェクトを収集（最前面=末尾）
+        objs = [obj for obj in tree_to_list(self.document, [])
+                if obj.x <= x < obj.x + obj.width
+                and obj.y <= y < obj.y + obj.height]
+
+        if not objs: return
+        elt = objs[-1].node  # 最も深い（最前面の）要素のDOMノード
+
+        # DOMツリーを親方向にたどり、<a>タグを探す
+        while elt:
+            if isinstance(elt, Text):
+                pass
+            elif elt.tag == "a" and "href" in elt.attributes:
+                url = self.url.resolve(elt.attributes["href"])
+                return self.load(url)
+            elt = elt.parent
+
+    def go_back(self):
+        """履歴を1つ戻る。現在のURLをpopし、その前のURLを再読み込みする。"""
+        if len(self.history) > 1:
+            self.history.pop()       # 現在のURLを破棄
+            back = self.history.pop() # 戻り先URL（load()で再追加される）
+            self.load(back)
+
+class Rect:
+    """矩形領域を表すユーティリティクラス。UI要素のヒットテストなどに使用する。"""
+
+    def __init__(self, left, top, right, bottom):
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+
+    def contains_point(self, x, y):
+        """座標(x, y)がこの矩形内に含まれるかを判定する"""
+        return x >= self.left and x < self.right \
+            and y >= self.top and y < self.bottom
+
+
+class DrawOutline:
+    """矩形の枠線描画コマンド。ボタンやアドレスバーの枠に使用する。"""
+
+    def __init__(self, rect, color, thickness):
+        self.rect = rect
+        self.color = color
+        self.thickness = thickness
+
+    def execute(self, scroll, canvas):
+        """スクロール量を考慮して枠線を描画する"""
+        canvas.create_rectangle(
+            self.rect.left, self.rect.top - scroll,
+            self.rect.right, self.rect.bottom - scroll,
+            width=self.thickness,
+            outline=self.color
+        )
+
+
+class DrawLine:
+    """直線描画コマンド。タブ区切り線やアドレスバーのカーソルなどに使用する。"""
+
+    def __init__(self, x1, y1, x2, y2, color, thickness):
+        self.rect = Rect(x1, y1, x2, y2)  # 始点(left,top)〜終点(right,bottom)
+        self.color = color
+        self.thickness = thickness
+
+    def execute(self, scroll, canvas):
+        """スクロール量を考慮して直線を描画する"""
+        canvas.create_line(
+            self.rect.left, self.rect.top - scroll,
+            self.rect.right, self.rect.bottom - scroll,
+            fill=self.color, width=self.thickness)
+
+class Chrome:
+    """ブラウザのUI部分（タブバー・アドレスバー・戻るボタン）を管理する。
+    描画コマンドの生成とクリック・キー入力のハンドリングを担当する。"""
+
+    def __init__(self, browser):
+        self.browser = browser
+        self.font = get_font(20, "normal", "roman")
+        self.font_height = self.font.metrics("linespace")
+        self.padding = 5
+
+        # --- タブバー領域の計算 ---
+        self.tabbar_top = 0
+        self.tabbar_bottom = self.font_height + 2*self.padding
+
+        # 新規タブボタン「+」の領域
+        plus_width = self.font.measure("+") + 2*self.padding
+        self.newtab_rect = Rect(
+            self.padding, self.padding,
+            self.padding + plus_width,
+            self.padding + self.font_height
+        )
+
+        # --- URLバー領域の計算 ---
+        self.bottom = self.tabbar_bottom
+        self.urlbar_top = self.tabbar_bottom
+        self.urlbar_bottom = self.urlbar_top + \
+            self.font_height + 2*self.padding
+        self.bottom = self.urlbar_bottom  # Chrome全体の下端
+
+        # 戻るボタン「<」の領域
+        back_width = self.font.measure("<") + 2*self.padding
+        self.back_rect = Rect(
+            self.padding,
+            self.urlbar_top + self.padding,
+            self.padding + back_width,
+            self.urlbar_bottom - self.padding)
+
+        # アドレスバーの領域（戻るボタンの右端〜ウィンドウ右端）
+        self.address_rect = Rect(
+            self.back_rect.right + self.padding,
+            self.urlbar_top + self.padding,
+            WIDTH - self.padding,
+            self.urlbar_bottom - self.padding)
+
+        self.focus = None        # 現在フォーカスがある要素（"address bar" or None）
+        self.address_bar = ""    # アドレスバーに入力中のテキスト
+
+    def tab_rect(self, i):
+        """i番目のタブの矩形領域を計算して返す"""
+        tabs_start = self.newtab_rect.right + self.padding
+        tab_width = self.font.measure("Tab X") + 2*self.padding
+        return Rect(
+            tabs_start + tab_width * i, self.tabbar_top,
+            tabs_start + tab_width * (i + 1), self.tabbar_bottom
+        )
+
+    def paint(self):
+        """Chrome部分の描画コマンドリストを生成する"""
+        cmds = []
+
+        # Chrome背景（白で塗りつぶしてページコンテンツを隠す）
+        cmds.append(DrawRect(0, 0, WIDTH, self.bottom, "white"))
+
+        # 新規タブボタン「+」
+        cmds.append(DrawOutline(self.newtab_rect, "black", 1))
+        cmds.append(DrawText(
+            self.newtab_rect.left + self.padding,
+            self.newtab_rect.top,
+            "+", self.font, "black"
+        ))
+
+        # 各タブの描画（左右の縦線・ラベル・アクティブタブの下線）
+        for i, tab in enumerate(self.browser.tabs):
+            bounds = self.tab_rect(i)
+            cmds.append(DrawLine(
+                bounds.left, 0, bounds.left, bounds.bottom,
+                "black", 1))
+            cmds.append(DrawLine(
+                bounds.right, 0, bounds.right, bounds.bottom,
+                "black", 1))
+            cmds.append(DrawText(
+                bounds.left + self.padding, bounds.top + self.padding,
+                "Tab {}".format(i), self.font, "black"))
+
+            # アクティブタブはタブ以外の領域に下線を引く（タブが前面に出ている表現）
+            if tab == self.browser.active_tab:
+                cmds.append(DrawLine(
+                    0, bounds.bottom, bounds.left, bounds.bottom,
+                    "black", 1))
+                cmds.append(DrawLine(
+                    bounds.right, bounds.bottom, WIDTH, bounds.bottom,
+                    "black", 1))
+
+        # タブバーとURLバーの境界線
+        cmds.append(DrawLine(
+            0, self.bottom, WIDTH,
+            self.bottom, "black", 1))
+
+        # 戻るボタン「<」
+        cmds.append(DrawOutline(self.back_rect, "black", 1))
+        cmds.append(DrawText(
+            self.back_rect.left + self.padding,
+            self.back_rect.top,
+            "<", self.font, "black"))
+
+        # アドレスバー
+        cmds.append(DrawOutline(self.address_rect, "black", 1))
+
+        if self.focus == "address bar":
+            # 入力中: 入力テキストとカーソル（赤い縦線）を表示
+            cmds.append(DrawText(self.address_rect.left + self.padding,
+                                 self.address_rect.top,
+                                 self.address_bar, self.font, "black"))
+            w = self.font.measure(self.address_bar)
+            cmds.append(DrawLine(
+                self.address_rect.left + self.padding + w,
+                self.address_rect.top,
+                self.address_rect.left + self.padding + w,
+                self.address_rect.bottom,
+                "red", 1))
+        else:
+            # 非フォーカス時: 現在のURLを表示
+            url = str(self.browser.active_tab.url)
+            cmds.append(DrawText(
+                self.address_rect.left + self.padding,
+                self.address_rect.top,
+                url, self.font, "black"))
+        return cmds
+
+    def click(self, x, y):
+        """Chrome領域のクリックイベントを処理する。
+        クリック位置に応じて新規タブ・戻る・アドレスバーフォーカス・タブ切替を行う。"""
+        self.focus = None
+        if self.newtab_rect.contains_point(x, y):
+            self.browser.new_tab(URL("https://browser.engineering/"))
+        elif self.back_rect.contains_point(x, y):
+            self.browser.active_tab.go_back()
+        elif self.address_rect.contains_point(x, y):
+            self.focus = "address bar"
+            self.address_bar = ""
+        else:
+            # タブバーのクリック: クリックされたタブをアクティブにする
+            for i, tab in enumerate(self.browser.tabs):
+                if self.tab_rect(i).contains_point(x, y):
+                    self.browser.active_tab = tab
+                    break
+
+    def keypress(self, char):
+        """アドレスバーにフォーカスがある場合、入力文字を追加する"""
+        if self.focus == "address bar":
+            self.address_bar += char
+
+    def enter(self):
+        """アドレスバーにフォーカスがある場合、入力URLを読み込む"""
+        if self.focus == "address bar":
+            self.browser.active_tab.load(URL(self.address_bar))
+            self.focus = None
+
+class Browser:
+    """ブラウザのトップレベルクラス。tkinterウィンドウの管理、タブの管理、
+    イベントハンドリング（キー入力・マウスクリック）を統括する。"""
+
+    def __init__(self):
+        self.tabs = []          # 開いているタブのリスト
+        self.active_tab = None  # 現在表示中のタブ
+
+        # tkinterウィンドウとキャンバスを初期化
+        self.window = tkinter.Tk()
+        self.canvas = tkinter.Canvas(
+            self.window,
+            width=WIDTH,
+            height=HEIGHT,
+            bg="white"
+        )
+        self.canvas.pack()
+        self.scroll = 0  # 現在のスクロール位置（ピクセル）
+
+        # イベントバインド
+        self.window.bind("<Down>", self.handle_down)      # ↓キー: スクロール
+        self.window.bind("<Button-1>", self.handle_click)  # 左クリック
+        self.chrome = Chrome(self)
+        self.window.bind("<Key>", self.handle_key)         # キー入力: アドレスバーへ
+        self.window.bind("<Return>", self.handle_enter)    # Enterキー: URL確定
+
+    def handle_down(self, e):
+        """↓キー押下時: アクティブタブをスクロールして再描画"""
+        self.active_tab.scrolldown()
+        self.draw()
+
+    def handle_click(self, e):
+        """クリック時: Chrome領域ならChromeに、それ以外はタブのコンテンツに委譲"""
+        if e.y < self.chrome.bottom:
+            self.chrome.click(e.x, e.y)
+        else:
+            tab_y = e.y - self.chrome.bottom  # Chrome分のオフセットを引く
+            self.active_tab.click(e.x, tab_y)
         self.draw()
 
     def draw(self):
-        """display_listの描画コマンドをキャンバスに描画する。
-        現在のビューポート（scroll〜scroll+HEIGHT）外のコマンドはスキップして高速化する。"""
+        """キャンバスを全消去し、タブのコンテンツとChromeを重ねて描画する"""
         self.canvas.delete("all")
-        for cmd in self.display_list:
-            if cmd.top > self.scroll + HEIGHT: continue  # 画面下より下は描画しない
-            if cmd.bottom < self.scroll: continue        # 画面上より上は描画しない
-            cmd.execute(self.scroll, self.canvas)
+        self.active_tab.draw(self.canvas, self.chrome.bottom)
 
-    def scrolldown(self, e):
-        """下矢印キー押下時にスクロール位置を更新して再描画する。
-        ページ末尾を超えないようにmax_yでクランプする。"""
-        max_y = max(self.document.height + 2*VSTEP - HEIGHT, 0)
-        self.scroll = min(self.scroll + SCROLL_STEP, max_y)
+        # Chromeはスクロールなし（scroll=0）で最前面に描画
+        for cmd in self.chrome.paint():
+            cmd.execute(0, self.canvas)
+
+    def new_tab(self, url):
+        """新しいタブを作成してURLを読み込み、アクティブにする"""
+        new_tab = Tab(HEIGHT - self.chrome.bottom)
+        new_tab.load(url)
+        self.active_tab = new_tab
+        self.tabs.append(new_tab)
         self.draw()
 
+    def handle_key(self, e):
+        """印字可能文字の入力をChromeに転送する（アドレスバー入力用）"""
+        if len(e.char) == 0: return
+        if not (0x20 <= ord(e.char) < 0x7f): return  # 印字可能ASCII文字のみ
+        self.chrome.keypress(e.char)
+        self.draw()
+
+    def handle_enter(self, e):
+        """Enterキー押下時: アドレスバーのURL確定をChromeに委譲"""
+        self.chrome.enter()
+        self.draw()
+    
 
 if __name__ == "__main__":
     import sys
-    Browser().load(URL(sys.argv[1]))
+    # コマンドライン引数のURLで新規タブを開き、tkinterイベントループを開始
+    Browser().new_tab(URL(sys.argv[1]))
     tkinter.mainloop()
