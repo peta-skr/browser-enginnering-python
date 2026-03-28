@@ -2,6 +2,7 @@ import socket
 import ssl
 import tkinter
 import tkinter.font
+import urllib.parse
 
 
 class URL:
@@ -29,7 +30,7 @@ class URL:
             self.host, port = self.host.split(":", 1)
             self.port = int(port)
 
-    def request(self):
+    def request(self, payload=None):
         # TCPソケットを作成
         s = socket.socket(
             family=socket.AF_INET,
@@ -44,9 +45,15 @@ class URL:
             s = ctx.wrap_socket(s, server_hostname=self.host)
 
         # HTTPリクエストを組み立てて送信
-        request = "GET {} HTTP/1.0\r\n".format(self.path)
+        method = "POST" if payload else "GET"
+        request = "{} {} HTTP/1.0\r\n".format(method, self.path)
         request += "Host: {}\r\n".format(self.host)
+        if payload:
+            length = len(payload.encode("utf8"))
+            request += "Content-Length: {}\r\n".format(length)
         request += "\r\n"
+        if payload:
+            request += payload
         s.send(request.encode("utf8"))
 
         # レスポンスをテキストモードで読み込む
@@ -194,8 +201,11 @@ class BlockLayout:
         else:
             if node.tag == "br":
                 self.new_line()
-            for child in node.children:
-                self.recurse(child)
+            elif node.tag == "input" or node.tag == "button":
+                self.input(node)
+            else:
+                for child in node.children:
+                    self.recurse(child)
 
     def layout_mode(self):
         """ノードのレイアウトモードを返す。
@@ -208,7 +218,7 @@ class BlockLayout:
                 child.tag in self.BLOCK_ELEMENTS
                 for child in self.node.children):
             return "block"
-        elif self.node.children:
+        elif self.node.children or self.node.tag == "input":
             return "inline"
         else:
             return "block"
@@ -270,11 +280,32 @@ class BlockLayout:
 
         return cmds
     
+    def input(self, node):
+        weight = node.style["font-weight"]
+        style = node.style["font-style"]
+        if style == "normal": style = "roman"
+        size = int(float(node.style["font-size"][:-2]) * .75)
+        font = get_font(size, weight, style)
+        w = INPUT_WIDTH_PX
+
+        if self.cursor_x + w > self.width:
+            self.new_line()
+
+        line = self.children[-1]
+        previous_word = line.children[-1] if line.children else None
+        input_layout = InputLayout(node, line, previous_word)
+        line.children.append(input_layout)
+        self.cursor_x += w + font.measure(" ")
+
     def new_line(self):
         self.cursor_x = 0
         last_line = self.children[-1] if self.children else None
         new_line = LineLayout(self.node, self, last_line)
         self.children.append(new_line)
+
+    def should_paint(self):
+        return isinstance(self.node, Text) or \
+        (self.node.tag != "input" and self.node.tag != "button")
 
 
 class DocumentLayout:
@@ -303,6 +334,9 @@ class DocumentLayout:
         # ドキュメントルート自体は描画コマンドを持たない
         return []
 
+    def should_paint(self):
+        return True
+
 
 class Text:
     """HTMLテキストノード。タグ間のテキスト内容を保持する。"""
@@ -311,6 +345,7 @@ class Text:
         self.text = text        # テキスト内容
         self.children = []      # テキストノードは子を持たない（常に空リスト）
         self.parent = parent    # 親Elementノード
+        self.is_focused = False
 
     def __repr__(self):
         return repr(self.text)
@@ -324,6 +359,7 @@ class Element:
         self.attributes = attributes  # 属性辞書（例: {"class": "foo"}）
         self.children = []          # 子ノードのリスト
         self.parent = parent        # 親ノード
+        self.is_focused = False
 
     def __repr__(self):
         return "<" + self.tag + ">"
@@ -676,6 +712,10 @@ class LineLayout:
         # 行自体は描画コマンドを持たない（子のTextLayoutが描画を担当）
         return []
 
+    def should_paint(self):
+        return True
+
+
 class TextLayout:
     """1単語分のレイアウトオブジェクト。フォント・座標・サイズを計算し、
     DrawTextコマンドを生成する最小描画単位。"""
@@ -712,6 +752,70 @@ class TextLayout:
         color = self.node.style["color"]
         return [DrawText(self.x, self.y, self.word, self.font, color)]
 
+    def should_paint(self):
+        return True
+
+
+INPUT_WIDTH_PX = 200
+
+
+class InputLayout:
+    def __init__(self, node, parent, previous):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
+
+    def layout(self):
+        weight = self.node.style["font-weight"]
+        style = self.node.style["font-style"]
+        if style == "normal": style = "roman"
+        size = int(float(self.node.style["font-size"][:-2]) * .75)
+        self.font = get_font(size, weight, style)
+
+        self.width = INPUT_WIDTH_PX
+
+        if self.previous:
+            space = self.previous.font.measure(" ")
+            self.x = self.previous.x + space + self.previous.width
+        else:
+            self.x = self.parent.x
+
+        self.height = self.font.metrics("linespace")
+
+    def should_paint(self):
+        return True
+
+    def self_rect(self):
+        return Rect(self.x, self.y,
+                    self.x + self.width, self.y + self.height)
+
+    def paint(self):
+        cmds = []
+        bgcolor = self.node.style.get("background-color", "transparent")
+        if bgcolor != "transparent":
+            rect = DrawRect(self.x, self.y,
+                            self.x + self.width, self.y + self.height, bgcolor)
+            cmds.append(rect)
+
+        if self.node.tag == "input":
+            text = self.node.attributes.get("value", "")
+        elif self.node.tag == "button":
+            if len(self.node.children) == 1 and \
+               isinstance(self.node.children[0], Text):
+                text = self.node.children[0].text
+            else:
+                print("Ignoring HTML contents inside button")
+                text = ""
+
+        color = self.node.style["color"]
+        cmds.append(DrawText(self.x, self.y, text, self.font, color))
+
+        if self.node.is_focused:
+            cx = self.x + self.font.measure(text)
+            cmds.append(DrawLine(cx, self.y, cx, self.y + self.height, "black", 1))
+
+        return cmds
 
 def style(node, rules):
     """CSSルールと継承プロパティをノードに適用し、子ノードへ再帰する。
@@ -761,7 +865,8 @@ def print_tree(node, indent=0):
 
 def paint_tree(layout_object, display_list):
     """レイアウトツリーを深さ優先で走査し、全描画コマンドをdisplay_listに収集する"""
-    display_list.extend(layout_object.paint())
+    if layout_object.should_paint():
+        display_list.extend(layout_object.paint())
     for child in layout_object.children:
         paint_tree(child, display_list)
 
@@ -793,16 +898,19 @@ class Tab:
         self.scroll = 0
         self.tab_height = tab_height
         self.history = []
+        self.nodes = []
+        self.rules = []
+        self.focus = None
 
-    def load(self, url):
+    def load(self, url, payload=None):
         """URLからHTMLを取得し、パース・スタイル適用・レイアウト・描画を行う"""
         self.history.append(url)
         self.url = url
-        body = url.request()
+        body = url.request(payload)
         self.nodes = HTMLParser(body).parse()
 
         # ① デフォルトスタイルシートを起点にルールを集める
-        rules = DEFAULT_STYLE_SHEET.copy()
+        self.rules = DEFAULT_STYLE_SHEET.copy()
 
         # ② <link rel=stylesheet> のCSSファイルをすべて収集して追加
         links = [node.attributes["href"]
@@ -817,10 +925,14 @@ class Tab:
                 css_body = style_url.request()
             except Exception:
                 continue
-            rules.extend(CSSParser(css_body).parse())
+            self.rules.extend(CSSParser(css_body).parse())
 
+        self.render()
+
+    
+    def render(self):
         # ③ ルールが全部揃ってから1回だけ style() を適用
-        style(self.nodes, sorted(rules, key=cascade_priority))
+        style(self.nodes, sorted(self.rules, key=cascade_priority))
 
         # ④ style() 完了後にレイアウトを計算（word() 内で node.style を参照するため）
         self.document = DocumentLayout(self.nodes)
@@ -828,6 +940,7 @@ class Tab:
 
         self.display_list = []
         paint_tree(self.document, self.display_list)
+
 
     def draw(self, canvas, offset):
         """display_listの描画コマンドをキャンバスに描画する。
@@ -846,6 +959,7 @@ class Tab:
     def click(self, x, y):
         """クリック座標にあるレイアウトオブジェクトを特定し、
         リンク（<a>タグ）であればそのhrefを読み込む。"""
+        self.focus = None
         y += self.scroll  # スクロールを考慮した絶対座標に変換
 
         # クリック座標に重なるレイアウトオブジェクトを収集（最前面=末尾）
@@ -856,13 +970,27 @@ class Tab:
         if not objs: return
         elt = objs[-1].node  # 最も深い（最前面の）要素のDOMノード
 
-        # DOMツリーを親方向にたどり、<a>タグを探す
+        if self.focus:
+            self.focus.is_focused = False
+
+        # DOMツリーを親方向にたどり、対応する要素を探す
         while elt:
             if isinstance(elt, Text):
                 pass
             elif elt.tag == "a" and "href" in elt.attributes:
                 url = self.url.resolve(elt.attributes["href"])
                 return self.load(url)
+            elif elt.tag == "input":
+                elt.attributes["value"] = ""
+                self.focus = elt
+                elt.is_focused = True
+                return self.render()
+            elif elt.tag == "button":
+                while elt:
+                    if elt.tag == "form" and "action" in elt.attributes:
+                        return self.submit_form(elt)
+                    elt = elt.parent
+                return
             elt = elt.parent
 
     def go_back(self):
@@ -871,6 +999,29 @@ class Tab:
             self.history.pop()       # 現在のURLを破棄
             back = self.history.pop() # 戻り先URL（load()で再追加される）
             self.load(back)
+    
+    def keypress(self, char):
+        if self.focus:
+            self.focus.attributes["value"] += char
+            self.render()
+
+    def submit_form(self, elt):
+        inputs = [node for node in tree_to_list(elt, [])
+                  if isinstance(node, Element)
+                  and node.tag == "input"
+                  and "name" in node.attributes]
+        
+        body = ""
+        for input in inputs:
+            name = input.attributes["name"]
+            value = input.attributes.get("value", "")
+            name = urllib.parse.quote(name)
+            value = urllib.parse.quote(value)
+            body += "&" + name + "=" + value
+        body = body[1:]
+
+        url = self.url.resolve(elt.attributes["action"])
+        self.load(url, body)
 
 class Rect:
     """矩形領域を表すユーティリティクラス。UI要素のヒットテストなどに使用する。"""
@@ -912,6 +1063,8 @@ class DrawLine:
         self.rect = Rect(x1, y1, x2, y2)  # 始点(left,top)〜終点(right,bottom)
         self.color = color
         self.thickness = thickness
+        self.top = y1
+        self.bottom = y2
 
     def execute(self, scroll, canvas):
         """スクロール量を考慮して直線を描画する"""
@@ -1067,10 +1220,16 @@ class Chrome:
                     self.browser.active_tab = tab
                     break
 
+    def blur(self):
+        """Chromeのフォーカスを解除する"""
+        self.focus = None
+
     def keypress(self, char):
         """アドレスバーにフォーカスがある場合、入力文字を追加する"""
         if self.focus == "address bar":
             self.address_bar += char
+            return True
+        return False
 
     def enter(self):
         """アドレスバーにフォーカスがある場合、入力URLを読み込む"""
@@ -1112,8 +1271,11 @@ class Browser:
     def handle_click(self, e):
         """クリック時: Chrome領域ならChromeに、それ以外はタブのコンテンツに委譲"""
         if e.y < self.chrome.bottom:
+            self.focus = None
             self.chrome.click(e.x, e.y)
         else:
+            self.focus = "content"
+            self.chrome.blur()
             tab_y = e.y - self.chrome.bottom  # Chrome分のオフセットを引く
             self.active_tab.click(e.x, tab_y)
         self.draw()
@@ -1139,8 +1301,11 @@ class Browser:
         """印字可能文字の入力をChromeに転送する（アドレスバー入力用）"""
         if len(e.char) == 0: return
         if not (0x20 <= ord(e.char) < 0x7f): return  # 印字可能ASCII文字のみ
-        self.chrome.keypress(e.char)
-        self.draw()
+        if self.chrome.keypress(e.char):
+            self.draw()
+        elif self.focus == "content":
+            self.active_tab.keypress(e.char)
+            self.draw()
 
     def handle_enter(self, e):
         """Enterキー押下時: アドレスバーのURL確定をChromeに委譲"""
