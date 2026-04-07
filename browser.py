@@ -6,6 +6,9 @@ import urllib.parse
 import dukpy
 
 
+SESSIONS = {}
+COOKIE_JAR = {}
+
 class URL:
     def __init__(self, url):
         # スキーム（http or https）とそれ以降のURLを分割
@@ -31,7 +34,7 @@ class URL:
             self.host, port = self.host.split(":", 1)
             self.port = int(port)
 
-    def request(self, payload=None):
+    def request(self, referrer, payload=None):
         # TCPソケットを作成
         s = socket.socket(
             family=socket.AF_INET,
@@ -49,6 +52,14 @@ class URL:
         method = "POST" if payload else "GET"
         request = "{} {} HTTP/1.0\r\n".format(method, self.path)
         request += "Host: {}\r\n".format(self.host)
+        if self.host in COOKIE_JAR:
+            cookie, params = COOKIE_JAR[self.host]
+            allow_cookie = True
+            if referrer and params.get("samesite", "none") == "lax":
+                if method != "GET":
+                    allow_cookie = self.host == referrer.host
+            if allow_cookie:
+                request += "Cookie: {}\r\n".format(cookie)
         if payload:
             length = len(payload.encode("utf8"))
             request += "Content-Length: {}\r\n".format(length)
@@ -72,6 +83,19 @@ class URL:
             header, value = line.split(":", 1)
             response_headers[header.casefold()] = value.strip()
 
+        if "set-cookie" in response_headers:
+            cookie = response_headers["set-cookie"]
+            params = {}
+            if ";" in cookie:
+                cookie, rest = cookie.split(";", 1)
+                for param in rest.split(";"):
+                    if '=' in param:
+                        param, value = param.split("=", 1)
+                    else:
+                        value = "true"
+                    params[param.strip().casefold()] = value.casefold()
+            COOKIE_JAR[self.host] = (cookie, params)
+
         # 本実装では非対応のエンコーディングが含まれていないことを確認
         assert "transfer-encoding" not in response_headers
         assert "content-encoding" not in response_headers
@@ -80,7 +104,7 @@ class URL:
         content = response.read()
         s.close()
 
-        return content
+        return response_headers, content
 
     def resolve(self, url):
         """相対URLを絶対URLに変換して返す。
@@ -101,6 +125,9 @@ class URL:
             # パス絶対URL（/path/...）にホスト・スキームを補完
             return URL(self.scheme + "://" + self.host + \
                        ":" + str(self.port) + url)
+    
+    def origin(self):
+        return self.scheme + "://" + self.host + ":" + str(self.port)
         
     def __str__(self):
         port_part = ":" + str(self.port)
@@ -761,21 +788,28 @@ INPUT_WIDTH_PX = 200
 
 
 class InputLayout:
+    """<input>/<button> 要素のインラインレイアウトオブジェクト。
+    TextLayoutと同じくインライン行（LineLayout）の子として配置される。
+    固定幅（INPUT_WIDTH_PX）で描画し、フォーカス時はカーソルを表示する。"""
+
     def __init__(self, node, parent, previous):
-        self.node = node
-        self.parent = parent
-        self.previous = previous
-        self.children = []
+        self.node = node          # 対応するHTMLノード（inputまたはbutton要素）
+        self.parent = parent      # 親LineLayout
+        self.previous = previous  # 同じ行内の直前の要素（x座標計算に使用）
+        self.children = []        # 葉ノードのため常に空
 
     def layout(self):
+        """フォントを決定し、x座標・幅・高さを計算する。
+        幅はINPUT_WIDTH_PX固定で、x座標は前の要素の右端から計算する。"""
         weight = self.node.style["font-weight"]
         style = self.node.style["font-style"]
         if style == "normal": style = "roman"
         size = int(float(self.node.style["font-size"][:-2]) * .75)
         self.font = get_font(size, weight, style)
 
-        self.width = INPUT_WIDTH_PX
+        self.width = INPUT_WIDTH_PX  # 入力欄は固定幅
 
+        # x座標: 前の要素の右端＋スペース幅、なければ行の先頭
         if self.previous:
             space = self.previous.font.measure(" ")
             self.x = self.previous.x + space + self.previous.width
@@ -792,6 +826,7 @@ class InputLayout:
                     self.x + self.width, self.y + self.height)
 
     def paint(self):
+        """入力欄の背景・テキスト・フォーカスカーソルの描画コマンドを返す"""
         cmds = []
         bgcolor = self.node.style.get("background-color", "transparent")
         if bgcolor != "transparent":
@@ -799,6 +834,7 @@ class InputLayout:
                             self.x + self.width, self.y + self.height, bgcolor)
             cmds.append(rect)
 
+        # 表示テキスト: inputはvalue属性、buttonは子テキストノードから取得
         if self.node.tag == "input":
             text = self.node.attributes.get("value", "")
         elif self.node.tag == "button":
@@ -812,6 +848,7 @@ class InputLayout:
         color = self.node.style["color"]
         cmds.append(DrawText(self.x, self.y, text, self.font, color))
 
+        # フォーカス時: テキスト末尾にカーソル（縦線）を描画
         if self.node.is_focused:
             cx = self.x + self.font.measure(text)
             cmds.append(DrawLine(cx, self.y, cx, self.y + self.height, "black", 1))
@@ -887,9 +924,9 @@ def cascade_priority(rule):
 
 
 # ブラウザのデフォルトスタイルシート（browser.cssから読み込み、起動時に1回だけパース）
-DEFAULT_STYLE_SHEET = CSSParser(open("browser.css").read()).parse()
+DEFAULT_STYLE_SHEET = CSSParser(open("browser.css", encoding="utf-8").read()).parse()
 
-RUNTIME_JS = open("runtime.js").read()
+RUNTIME_JS = open("runtime.js", encoding="utf-8").read()
 
 # JSからPython側でイベントを発火する際に evaljs で実行するコード断片。
 # dukpy.handle / dukpy.type は evaljs のキーワード引数で注入される。
@@ -973,6 +1010,18 @@ class JSContext:
         for child in elt.children:
             child.parent = elt
         self.tab.render()
+    
+    def XMLHttpRequest_send(self, method, url, body):
+        """JSのXMLHttpRequest.send()から呼ばれるPython側の実装。
+        CSP違反またはクロスオリジンXHRの場合は例外を送出してJSに伝える。
+        同期XHRのみ対応（runtime.jsでis_async=trueは拒否している）。"""
+        full_url = self.tab.url.resolve(url)
+        if not self.tab.allowed_request(full_url):
+            raise Exception("Cross-origin XHR blocked by CSP")
+        if full_url.origin() != self.tab.url.origin():
+            raise Exception("Cross-origin XHR request not allowed")
+        headers, out = full_url.request(self.tab.url, body)
+        return out
 
 class Tab:
     """ブラウザのメインクラス。ウィンドウ・キャンバス・スクロール状態を管理し、
@@ -991,8 +1040,16 @@ class Tab:
         """URLからHTMLを取得し、パース・スタイル適用・レイアウト・描画を行う"""
         self.history.append(url)
         self.url = url
-        body = url.request(payload)
+        headers, body = url.request(None, payload)
         self.nodes = HTMLParser(body).parse()
+
+        self.allowed_origins = None
+        if "content-security-policy" in headers:
+            csp = headers["content-security-policy"].split()
+            if len(csp) > 0 and csp[0] == "default-src":
+                self.allowed_origins = []
+                for origin in csp[1:]:
+                    self.allowed_origins.append(URL(origin).origin())
 
         scripts = [node.attributes["src"] for node in tree_to_list(self.nodes, [])
                    if isinstance(node, Element)
@@ -1002,8 +1059,11 @@ class Tab:
         self.js = JSContext(self)
         for script in scripts:
             script_url = url.resolve(script)
+            if not self.allowed_request(script_url):
+                print("Blocked script", script, "due to CSP")
+                continue
             try:
-                body = script_url.request()
+                _, body = script_url.request(url)
             except:
                 continue
             self.js.run(script, body)
@@ -1020,8 +1080,11 @@ class Tab:
                  and "href" in node.attributes]
         for link in links:
             style_url = url.resolve(link)
+            if not self.allowed_request(style_url):
+                print("Blocked stylesheet", link, "due to CSP")
+                continue
             try:
-                css_body = style_url.request()
+                _, css_body = style_url.request(url)
             except Exception:
                 continue
             self.rules.extend(CSSParser(css_body).parse())
@@ -1103,18 +1166,24 @@ class Tab:
             self.load(back)
     
     def keypress(self, char):
+        """フォーカス中の<input>要素に文字を追記し、JSのkeydownイベントを発火する。
+        preventDefault()が呼ばれた場合はデフォルト動作（文字追記）をスキップする。"""
         if self.focus:
             if self.js.dispatch_event("keydown", self.focus): return
             self.focus.attributes["value"] += char
             self.render()
 
     def submit_form(self, elt):
+        """フォームの<input>要素を収集してURLエンコードし、POSTリクエストを送信する。
+        JSのsubmitイベントでpreventDefault()が呼ばれた場合はスキップする。"""
         if self.js.dispatch_event("submit", elt): return
+        # フォーム内の全<input name=...>要素を収集
         inputs = [node for node in tree_to_list(elt, [])
                   if isinstance(node, Element)
                   and node.tag == "input"
                   and "name" in node.attributes]
 
+        # name=value をURLエンコードして "&" で連結（先頭の "&" を除去）
         body = ""
         for input in inputs:
             name = input.attributes["name"]
@@ -1126,6 +1195,13 @@ class Tab:
 
         url = self.url.resolve(elt.attributes["action"])
         self.load(url, body)
+
+    def allowed_request(self, url):
+        """CSP（Content-Security-Policy）の allowed_origins リストに基づき、
+        指定URLへのリクエストが許可されているか判定する。
+        CSPヘッダーが未設定（allowed_origins == None）の場合はすべて許可する。"""
+        return self.allowed_origins == None or \
+            url.origin() in self.allowed_origins
 
 class Rect:
     """矩形領域を表すユーティリティクラス。UI要素のヒットテストなどに使用する。"""
