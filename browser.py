@@ -1,7 +1,11 @@
 import socket
 import ssl
-import tkinter
-import tkinter.font
+import ctypes
+import math
+import sys
+import sdl2
+import skia
+import OpenGL.GL
 import urllib.parse
 import dukpy
 
@@ -125,10 +129,10 @@ class URL:
             # パス絶対URL（/path/...）にホスト・スキームを補完
             return URL(self.scheme + "://" + self.host + \
                        ":" + str(self.port) + url)
-    
+
     def origin(self):
         return self.scheme + "://" + self.host + ":" + str(self.port)
-        
+
     def __str__(self):
         port_part = ":" + str(self.port)
         if self.scheme == "https" and self.port == 443:
@@ -138,31 +142,106 @@ class URL:
         return self.scheme + "://" + self.host + port_part + self.path
 
 
-# フォントオブジェクトのキャッシュ（サイズ・ウェイト・スタイルをキーとする）
+# ============================================================
+# フォントシステム（Skia版）
+# ============================================================
+# Typefaceオブジェクトをキャッシュするグローバル辞書
+# キーは(weight, style)で、Typefaceは重いオブジェクトなので再生成を避ける
 FONTS = {}
 
 def get_font(size, weight, style):
-    """フォントオブジェクトをキャッシュから取得、なければ作成して登録する"""
-    key = (size, weight, style)
+    """Skia版フォント取得。Typefaceをキャッシュし、Fontはサイズ付きで毎回生成（軽量）"""
+    key = (weight, style)
     if key not in FONTS:
-        font = tkinter.font.Font(size=size, weight=weight, slant=style)
-        # Labelと紐付けることでmetricsのパフォーマンスが向上する（Tk推奨）
-        label = tkinter.Label(font=font)
-        FONTS[key] = (font, label)
-    return FONTS[key][0]
+        if weight == "bold":
+            skia_weight = skia.FontStyle.kBold_Weight
+        else:
+            skia_weight = skia.FontStyle.kNormal_Weight
+        if style == "italic":
+            skia_slant = skia.FontStyle.kItalic_Slant
+        else:
+            skia_slant = skia.FontStyle.kUpright_Slant
+        skia_width = skia.FontStyle.kNormal_Width
+        style_info = skia.FontStyle(skia_weight, skia_width, skia_slant)
+        FONTS[key] = skia.Typeface('Arial', style_info)
+    return skia.Font(FONTS[key], size)
+
+def linespace(font):
+    """Skiaのフォントメトリクスから行間（行の高さ）を求める。
+    Skiaではascentが負の値（上方向が負）なので、descent - ascent で正の行高になる。"""
+    metrics = font.getMetrics()
+    return metrics.fDescent - metrics.fAscent
+
+def font_measureText(font, text):
+    """Skiaのフォントでテキスト幅を測定する。Tkinterのfont.measure()の代替。"""
+    return font.measureText(text)
 
 
+# ============================================================
+# 色のパースと名前付き色
+# ============================================================
+NAMED_COLORS = {
+    "black": "#000000",
+    "gray":  "#808080",
+    "white": "#ffffff",
+    "red":   "#ff0000",
+    "green": "#00ff00",
+    "blue":  "#0000ff",
+    "lightblue": "#add8e6",
+    "lightgreen": "#90ee90",
+    "orange": "#ffa500",
+    "orangered": "#ff4500",
+}
+
+def parse_color(color):
+    """CSS色文字列をskia.Colorに変換する。
+    #rrggbb (7文字), #rrggbbaa (9文字), 名前付き色に対応。"""
+    if color.startswith("#") and len(color) == 7:
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+        return skia.Color(r, g, b)
+    elif color.startswith("#") and len(color) == 9:
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+        a = int(color[7:9], 16)
+        return skia.Color(r, g, b, a)
+    elif color in NAMED_COLORS:
+        return parse_color(NAMED_COLORS[color])
+    else:
+        return skia.ColorBLACK
+
+def parse_blend_mode(blend_mode_str):
+    """CSSのmix-blend-mode文字列をSkiaのBlendMode定数に変換する"""
+    if blend_mode_str == "multiply":
+        return skia.BlendMode.kMultiply
+    elif blend_mode_str == "difference":
+        return skia.BlendMode.kDifference
+    elif blend_mode_str == "destination-in":
+        return skia.BlendMode.kDstIn
+    elif blend_mode_str == "source-over":
+        return skia.BlendMode.kSrcOver
+    else:
+        return skia.BlendMode.kSrcOver
+
+
+# ============================================================
+# 定数
+# ============================================================
 WIDTH, HEIGHT = 800, 600    # ウィンドウの幅と高さ（ピクセル）
 HSTEP, VSTEP = 13, 18       # 水平・垂直方向の初期オフセット
 SCROLL_STEP = 100            # 1回のスクロール量（ピクセル）
 
 
+# ============================================================
+# レイアウトクラス群
+# ============================================================
 class BlockLayout:
     """HTMLノード1つに対応するレイアウトオブジェクト。
     ブロックモード（子を縦に積む）とインラインモード（テキストを横に並べる）
     の2種類のレイアウトを担当する。"""
 
-    # ブロック要素として扱うタグ名の一覧（これに該当する子を持つ場合はブロックモードになる）
     BLOCK_ELEMENTS = [
         "html", "body", "article", "section", "nav", "aside",
         "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "header",
@@ -173,24 +252,23 @@ class BlockLayout:
     ]
 
     def __init__(self, node, parent, previous):
-        self.node = node          # 対応するHTMLノード（ElementまたはText）
-        self.parent = parent      # 親レイアウトオブジェクト
-        self.previous = previous  # 直前の兄弟レイアウトオブジェクト（y座標計算に使用）
-        self.children = []        # 子レイアウトオブジェクトのリスト
-        self.x = None             # ページ上の絶対X座標（layout()で確定）
-        self.y = None             # ページ上の絶対Y座標（layout()で確定）
-        self.width = None         # 幅（親の幅を継承）
-        self.height = None        # 高さ（layout()で確定）
-        self.display_list = []    # インラインモード時の描画情報（x, y, word, font, color）のリスト
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
+        self.x = None
+        self.y = None
+        self.width = None
+        self.height = None
 
     def word(self, node, word):
-        """1単語を行バッファに追加する。行幅を超える場合は新しい行へ折り返してから追加する"""
+        """1単語を行バッファに追加する。行幅を超える場合は新しい行へ折り返す"""
         weight = node.style["font-weight"]
         style = node.style["font-style"]
         if style == "normal": style = "roman"
         size = int(float(node.style["font-size"][:-2]) * .75)
         font = get_font(size, weight, style)
-        w = font.measure(word)
+        w = font_measureText(font, word)
 
         if self.cursor_x + w > self.width:
             self.new_line()
@@ -199,30 +277,10 @@ class BlockLayout:
         previous_word = line.children[-1] if line.children else None
         text = TextLayout(node, word, line, previous_word)
         line.children.append(text)
-        self.cursor_x += w + font.measure(" ")
-
-    def flush(self):
-        """行バッファの内容をdisplay_listに書き出す。"""
-        if not self.line: return
-
-        metrics = [font.metrics() for x, word, font, color in self.line]
-
-        max_ascent = max([metric["ascent"] for metric in metrics])
-        baseline = self.cursor_y + 1.25 * max_ascent
-
-        for rel_x, word, font, color in self.line:
-            x = self.x + rel_x
-            y = self.y + baseline - font.metrics("ascent")
-            self.display_list.append((x, y, word, font, color))
-
-        max_descent = max([metric["descent"] for metric in metrics])
-        self.cursor_y = baseline + 1.25 * max_descent
-
-        self.cursor_x = 0
-        self.line = []
+        self.cursor_x += w + font_measureText(font, " ")
 
     def recurse(self, node):
-        """HTMLツリーを深さ優先で再帰走査し、テキストを単語単位でレイアウトする（インラインモード専用）"""
+        """HTMLツリーを深さ優先で再帰走査し、テキストを単語単位でレイアウトする"""
         if isinstance(node, Text):
             for word in node.text.split():
                 self.word(node, word)
@@ -236,10 +294,6 @@ class BlockLayout:
                     self.recurse(child)
 
     def layout_mode(self):
-        """ノードのレイアウトモードを返す。
-        Textノードは常にinline。
-        Elementノードがブロック要素の子を1つでも持つ場合はblock、
-        それ以外の子がある場合はinline、子がなければblockとする。"""
         if isinstance(self.node, Text):
             return "inline"
         elif any(isinstance(child, Element) and \
@@ -252,15 +306,9 @@ class BlockLayout:
             return "block"
 
     def layout(self):
-        """座標・サイズを確定させる。
-        blockモード: 子ノードをBlockLayoutとして生成し縦に積む。
-        inlineモード: テキストを単語単位で配置し行バッファに蓄積する。
-        最後に全子のlayout()を再帰呼び出しし、高さを集計する。"""
-        # 親と同じx座標・幅を引き継ぐ
         self.x = self.parent.x
         self.width = self.parent.width
 
-        # y座標は直前の兄弟の末尾、なければ親の先頭
         if self.previous:
             self.y = self.previous.y + self.previous.height
         else:
@@ -269,45 +317,40 @@ class BlockLayout:
         mode = self.layout_mode()
 
         if mode == "block":
-            # ブロックモード: 子ノードごとにBlockLayoutを生成
             previous = None
             for child in self.node.children:
                 next_child = BlockLayout(child, self, previous)
                 self.children.append(next_child)
                 previous = next_child
         else:
-            # インラインモード: テキストを単語単位で行バッファに積む
             self.cursor_x = 0
-            # self.cursor_y = 0
-            # self.line = []
             self.new_line()
             self.recurse(self.node)
-            # self.flush()
 
-        # 子レイアウトを再帰的に確定
         for child in self.children:
             child.layout()
 
-        # 高さの集計
         self.height = sum([child.height for child in self.children])
 
     def self_rect(self):
-        return Rect(self.x, self.y,
-                    self.x + self.width, self.y + self.height)
+        return skia.Rect.MakeLTRB(
+            self.x, self.y,
+            self.x + self.width, self.y + self.height)
 
     def paint(self):
-        """描画コマンドリストを返す。
-        背景色（background-color）が設定されていればDrawRectを追加する。"""
         cmds = []
-
         if isinstance(self.node, Element):
             bgcolor = self.node.style.get("background-color", "transparent")
             if bgcolor != "transparent":
-                rect = DrawRect(self.x, self.y, self.x + self.width, self.y + self.height, bgcolor)
-                cmds.append(rect)
-
+                radius = float(self.node.style.get("border-radius", "0px")[:-2])
+                cmds.append(DrawRRect(self.self_rect(), radius, bgcolor))
         return cmds
-    
+
+    def paint_effects(self, cmds):
+        """ビジュアルエフェクトを適用する（opacity, blend-mode, overflow clip）"""
+        cmds = paint_visual_effects(self.node, cmds, self.self_rect())
+        return cmds
+
     def input(self, node):
         weight = node.style["font-weight"]
         style = node.style["font-style"]
@@ -323,7 +366,7 @@ class BlockLayout:
         previous_word = line.children[-1] if line.children else None
         input_layout = InputLayout(node, line, previous_word)
         line.children.append(input_layout)
-        self.cursor_x += w + font.measure(" ")
+        self.cursor_x += w + font_measureText(font, " ")
 
     def new_line(self):
         self.cursor_x = 0
@@ -337,11 +380,11 @@ class BlockLayout:
 
 
 class DocumentLayout:
-    """ページ全体のルートレイアウト。ウィンドウ幅・余白を設定してBlockLayoutのルートを生成する。"""
+    """ページ全体のルートレイアウト"""
 
     def __init__(self, node):
-        self.node = node    # HTMLツリーのルートノード
-        self.parent = None  # ルートなので親はなし
+        self.node = node
+        self.parent = None
         self.children = []
         self.x = None
         self.y = None
@@ -349,7 +392,6 @@ class DocumentLayout:
         self.height = None
 
     def layout(self):
-        """ウィンドウ幅から余白を引いた領域にルートBlockLayoutを配置する"""
         self.width = WIDTH - 2*HSTEP
         self.x = HSTEP
         self.y = VSTEP
@@ -359,20 +401,22 @@ class DocumentLayout:
         self.height = child.height
 
     def paint(self):
-        # ドキュメントルート自体は描画コマンドを持たない
         return []
+
+    def paint_effects(self, cmds):
+        return cmds
 
     def should_paint(self):
         return True
 
 
 class Text:
-    """HTMLテキストノード。タグ間のテキスト内容を保持する。"""
+    """HTMLテキストノード"""
 
     def __init__(self, text, parent):
-        self.text = text        # テキスト内容
-        self.children = []      # テキストノードは子を持たない（常に空リスト）
-        self.parent = parent    # 親Elementノード
+        self.text = text
+        self.children = []
+        self.parent = parent
         self.is_focused = False
 
     def __repr__(self):
@@ -380,13 +424,13 @@ class Text:
 
 
 class Element:
-    """HTMLタグノード。タグ名・属性・子ノードを保持する。"""
+    """HTMLタグノード"""
 
     def __init__(self, tag, attributes, parent):
-        self.tag = tag              # タグ名（例: "div", "p"）
-        self.attributes = attributes  # 属性辞書（例: {"class": "foo"}）
-        self.children = []          # 子ノードのリスト
-        self.parent = parent        # 親ノード
+        self.tag = tag
+        self.attributes = attributes
+        self.children = []
+        self.parent = parent
         self.is_focused = False
 
     def __repr__(self):
@@ -394,7 +438,7 @@ class Element:
 
 
 class HTMLParser:
-    """HTMLソーステキストをパースしてDOMツリー（TextとElementの木構造）を構築する。"""
+    """HTMLソーステキストをパースしてDOMツリーを構築する"""
 
     SELF_CLOSING_TAGS = [
         "area", "base", "br", "col", "embed", "hr", "img", "input",
@@ -406,12 +450,10 @@ class HTMLParser:
     ]
 
     def __init__(self, body):
-        self.body = body        # パース対象のHTMLソース文字列
-        self.unfinished = []    # 開いているが閉じていないElementノードのスタック
+        self.body = body
+        self.unfinished = []
 
     def parse(self):
-        """HTMLソースを1文字ずつ走査し、テキストとタグに分けて処理する。
-        '<' でタグ開始、'>' でタグ終了と判断し、最後にfinish()でツリーを確定する。"""
         text = ""
         in_tag = False
         for c in self.body:
@@ -430,7 +472,6 @@ class HTMLParser:
         return self.finish()
 
     def add_text(self, text):
-        """テキストノードを現在の親要素に追加する。空白のみのテキストは無視する。"""
         if text.isspace(): return
         self.implicit_tags(None)
         parent = self.unfinished[-1]
@@ -438,33 +479,25 @@ class HTMLParser:
         parent.children.append(node)
 
     def add_tag(self, tag):
-        """タグ文字列を解析してDOMノードをスタックに積む（または閉じる）。
-        '!' 始まりのコメント・DOCTYPE宣言は無視する。
-        '/' 始まりは閉じタグ、SELF_CLOSING_TAGSは即座に親に追加、
-        それ以外は開きタグとしてunfinishedスタックに積む。"""
         tag, attributes = self.get_attributes(tag)
-        if tag.startswith("!"): return  # コメント・DOCTYPEを無視
+        if tag.startswith("!"): return
         self.implicit_tags(tag)
 
         if tag.startswith("/"):
-            # 閉じタグ: スタックからポップして親の子に追加
-            if len(self.unfinished) == 1: return  # ルート要素は閉じない
+            if len(self.unfinished) == 1: return
             node = self.unfinished.pop()
             parent = self.unfinished[-1]
             parent.children.append(node)
         elif tag in self.SELF_CLOSING_TAGS:
-            # 自己終了タグ: 即座に親の子として追加
             parent = self.unfinished[-1]
             node = Element(tag, attributes, parent)
             parent.children.append(node)
         else:
-            # 開きタグ: スタックに積んで閉じタグを待つ
             parent = self.unfinished[-1] if self.unfinished else None
             node = Element(tag, attributes, parent)
             self.unfinished.append(node)
 
     def finish(self):
-        """パース終了処理。未閉じのノードをすべて閉じてルートノードを返す。"""
         if not self.unfinished:
             self.implicit_tags(None)
         while len(self.unfinished) > 1:
@@ -474,9 +507,6 @@ class HTMLParser:
         return self.unfinished.pop()
 
     def get_attributes(self, text):
-        """タグ文字列をタグ名と属性辞書に分解して返す。
-        属性値はクォートで囲まれている場合は除去する。
-        値のない属性は空文字列を値として登録する。"""
         parts = text.split()
         tag = parts[0].casefold()
         attributes = {}
@@ -484,60 +514,53 @@ class HTMLParser:
             if "=" in attrpair:
                 key, value = attrpair.split("=", 1)
                 if len(value) > 2 and value[0] in ["'", "\""]:
-                    value = value[1:-1]  # クォートを除去
+                    value = value[1:-1]
                 attributes[key.casefold()] = value
             else:
-                attributes[attrpair.casefold()] = ""  # 値なし属性
+                attributes[attrpair.casefold()] = ""
         return tag, attributes
 
     def implicit_tags(self, tag):
-        """暗黙的なタグを補完する。
-        HTMLでは<html>/<head>/<body>が省略可能なため、
-        現在のスタック状態と次のタグに応じて必要なタグを自動挿入する。"""
         while True:
             open_tags = [node.tag for node in self.unfinished]
             if open_tags == [] and tag != "html":
-                # ルートに<html>がなければ補完
                 self.add_tag("html")
             elif open_tags == ["html"] \
                     and tag not in ["head", "body", "/html"]:
-                # <html>直下でhead/bodyタグでない場合、適切な方を補完
                 if tag in self.HEAD_TAGS:
                     self.add_tag("head")
                 else:
                     self.add_tag("body")
             elif open_tags == ["html", "head"] and \
                     tag not in ["/head"] + self.HEAD_TAGS:
-                # <head>内でない要素が来たら</head>を補完して閉じる
                 self.add_tag("/head")
             else:
                 break
 
 
+# ============================================================
+# 描画コマンド群（Skia Canvas API版）
+# ============================================================
 class DrawText:
-    """テキスト描画コマンド。Canvas.create_text()のパラメータを保持する。"""
+    """テキスト描画コマンド（Skia版）"""
 
     def __init__(self, x1, y1, text, font, color):
-        self.top = y1
         self.left = x1
+        self.top = y1
         self.text = text
         self.font = font
-        self.bottom = y1 + font.metrics("linespace")  # 描画範囲の下端（スクロール判定に使用）
         self.color = color
+        self.bottom = y1 + linespace(font)
+        self.rect = skia.Rect.MakeLTRB(x1, y1, x1 + font_measureText(font, text), self.bottom)
 
-    def execute(self, scroll, canvas):
-        """スクロール量を考慮してキャンバスにテキストを描画する"""
-        canvas.create_text(
-            self.left, self.top - scroll,
-            text=self.text,
-            font=self.font,
-            anchor='nw',
-            fill=self.color
-        )
+    def execute(self, canvas):
+        paint = skia.Paint(AntiAlias=True, Color=parse_color(self.color))
+        baseline = self.top - self.font.getMetrics().fAscent
+        canvas.drawString(self.text, float(self.left), baseline, self.font, paint)
 
 
 class DrawRect:
-    """矩形描画コマンド。背景色ブロックの描画に使用する。"""
+    """矩形描画コマンド（Skia版）"""
 
     def __init__(self, x1, y1, x2, y2, color):
         self.top = y1
@@ -545,18 +568,123 @@ class DrawRect:
         self.bottom = y2
         self.right = x2
         self.color = color
+        self.rect = skia.Rect.MakeLTRB(x1, y1, x2, y2)
 
-    def execute(self, scroll, canvas):
-        """スクロール量を考慮してキャンバスに塗りつぶし矩形を描画する（枠線なし）"""
-        canvas.create_rectangle(
-            self.left, self.top - scroll,
-            self.right, self.bottom - scroll,
-            width=0,    # 枠線の幅を0にして塗りつぶしのみにする
-            fill=self.color
+    def execute(self, canvas):
+        paint = skia.Paint(Color=parse_color(self.color))
+        canvas.drawRect(self.rect, paint)
+
+
+class DrawRRect:
+    """角丸矩形描画コマンド。CSSのborder-radiusに対応する。"""
+
+    def __init__(self, rect, radius, color):
+        self.rect = rect
+        self.rrect = skia.RRect.MakeRectXY(rect, radius, radius)
+        self.color = color
+        self.top = rect.top()
+        self.bottom = rect.bottom()
+
+    def execute(self, canvas):
+        paint = skia.Paint(Color=parse_color(self.color))
+        canvas.drawRRect(self.rrect, paint)
+
+
+class DrawLine:
+    """直線描画コマンド（Skia版）"""
+
+    def __init__(self, x1, y1, x2, y2, color, thickness):
+        self.left = x1
+        self.top = y1
+        self.right = x2
+        self.bottom = y2
+        self.color = color
+        self.thickness = thickness
+        self.rect = skia.Rect.MakeLTRB(x1, y1, x2, y2)
+
+    def execute(self, canvas):
+        path = skia.Path()
+        path.moveTo(self.left, self.top)
+        path.lineTo(self.right, self.bottom)
+        paint = skia.Paint(
+            Color=parse_color(self.color),
+            StrokeWidth=self.thickness,
+            Style=skia.Paint.kStroke_Style,
         )
+        canvas.drawPath(path, paint)
 
 
-# 親ノードから子ノードへ継承されるCSSプロパティとそのデフォルト値
+class DrawOutline:
+    """矩形の枠線描画コマンド（Skia版）"""
+
+    def __init__(self, rect, color, thickness):
+        self.rect = rect
+        self.color = color
+        self.thickness = thickness
+        self.top = rect.top()
+        self.bottom = rect.bottom()
+
+    def execute(self, canvas):
+        paint = skia.Paint(
+            Color=parse_color(self.color),
+            StrokeWidth=self.thickness,
+            Style=skia.Paint.kStroke_Style,
+        )
+        canvas.drawRect(self.rect, paint)
+
+
+# ============================================================
+# ビジュアルエフェクト: Blendコマンド
+# ============================================================
+class Blend:
+    """OpacityとBlendModeを統合したビジュアルエフェクトコマンド。
+    saveLayerで新しいサーフェスを作り、子コマンドを描画し、restoreで親へブレンドする。
+    最適化: opacity=1.0かつblend_mode無しの場合はsaveLayerをスキップする。"""
+
+    def __init__(self, opacity, blend_mode, children):
+        self.opacity = opacity
+        self.blend_mode = blend_mode
+        self.children = children
+        self.should_save = self.blend_mode or self.opacity < 1
+        self.rect = skia.Rect.MakeEmpty()
+        for cmd in self.children:
+            self.rect.join(cmd.rect)
+        self.top = self.rect.top()
+        self.bottom = self.rect.bottom()
+
+    def execute(self, canvas):
+        paint = skia.Paint(
+            Alphaf=self.opacity,
+            BlendMode=parse_blend_mode(self.blend_mode),
+        )
+        if self.should_save:
+            canvas.saveLayer(None, paint)
+        for cmd in self.children:
+            cmd.execute(canvas)
+        if self.should_save:
+            canvas.restore()
+
+
+def paint_visual_effects(node, cmds, rect):
+    """ノードのCSSプロパティに基づいてビジュアルエフェクトを適用する。
+    opacity, mix-blend-mode, overflow:clip をまとめて処理する。"""
+    opacity = float(node.style.get("opacity", "1.0"))
+    blend_mode = node.style.get("mix-blend-mode")
+
+    if node.style.get("overflow", "visible") == "clip":
+        border_radius = float(node.style.get("border-radius", "0px")[:-2])
+        if not blend_mode:
+            blend_mode = "source-over"
+        cmds.append(Blend(1.0, "destination-in", [
+            DrawRRect(rect, border_radius, "white")
+        ]))
+
+    return [Blend(opacity, blend_mode, cmds)]
+
+
+# ============================================================
+# CSS関連
+# ============================================================
 INHERITED_PROPERTIES = {
     "font-size": "16px",
     "font-style": "normal",
@@ -566,20 +694,15 @@ INHERITED_PROPERTIES = {
 
 
 class CSSParser:
-    """CSSソーステキストをパースして（セレクタ, スタイル辞書）のリストを生成する。
-    self.i がカーソル位置を示し、各メソッドが少しずつ消費していく再帰下降パーサ。"""
-
     def __init__(self, s):
-        self.s = s  # パース対象のCSS文字列
-        self.i = 0  # 現在のパース位置
+        self.s = s
+        self.i = 0
 
     def whitespace(self):
-        """空白文字をスキップしてカーソルを進める"""
         while self.i < len(self.s) and self.s[self.i].isspace():
             self.i += 1
 
     def word(self):
-        """英数字・#・-・.・% から構成されるトークンを読み取って返す"""
         start = self.i
         while self.i < len(self.s):
             if self.s[self.i].isalnum() or self.s[self.i] in "#-.%":
@@ -591,13 +714,11 @@ class CSSParser:
         return self.s[start:self.i]
 
     def literal(self, literal):
-        """期待する1文字を消費する。一致しない場合は例外を送出する"""
         if not (self.i < len(self.s) and self.s[self.i] == literal):
             raise Exception("Parsing error")
         self.i += 1
 
     def pair(self):
-        """'property: value' の形式を読み取り、(プロパティ名, 値) のタプルを返す"""
         prop = self.word()
         self.whitespace()
         self.literal(":")
@@ -606,8 +727,6 @@ class CSSParser:
         return prop.casefold(), val
 
     def body(self):
-        """CSSブロック内（{} の中身）をパースしてプロパティ辞書を返す。
-        パースエラーが発生したプロパティは ';' または '}' まで読み飛ばして継続する。"""
         pairs = {}
         while self.i < len(self.s) and self.s[self.i] != "}":
             try:
@@ -626,7 +745,6 @@ class CSSParser:
         return pairs
 
     def ignore_until(self, chars):
-        """指定文字のいずれかが現れるまでカーソルを進め、その文字を返す。末尾に達した場合はNoneを返す。"""
         while self.i < len(self.s):
             if self.s[self.i] in chars:
                 return self.s[self.i]
@@ -635,8 +753,6 @@ class CSSParser:
         return None
 
     def selector(self):
-        """セレクタを解析して TagSelector または DescendantSelector を返す。
-        スペース区切りのタグ名は子孫セレクタとしてネストする。"""
         out = TagSelector(self.word().casefold())
         self.whitespace()
         while self.i < len(self.s) and self.s[self.i] != "{":
@@ -647,8 +763,6 @@ class CSSParser:
         return out
 
     def parse(self):
-        """CSSソース全体をパースし、(セレクタ, スタイル辞書) のリストを返す。
-        パースエラーが発生したルールは '}'まで読み飛ばして継続する。"""
         rules = []
         while self.i < len(self.s):
             try:
@@ -670,115 +784,109 @@ class CSSParser:
 
 
 class TagSelector:
-    """タグ名によるCSSセレクタ（例: `p`, `div`）。優先度は1。"""
-
     def __init__(self, tag):
         self.tag = tag
-        self.priority = 1  # タグセレクタの詳細度は1
+        self.priority = 1
 
     def matches(self, node):
-        """ノードがElementかつタグ名が一致する場合にTrueを返す"""
         return isinstance(node, Element) and self.tag == node.tag
 
 
 class DescendantSelector:
-    """子孫セレクタ（例: `div p`）。ancestor の子孫に descendant が存在するか判定する。
-    優先度は構成要素の優先度の合計。"""
-
     def __init__(self, ancestor, descendant):
         self.ancestor = ancestor
         self.descendant = descendant
-        self.priority = ancestor.priority + descendant.priority  # 詳細度を加算
+        self.priority = ancestor.priority + descendant.priority
 
     def matches(self, node):
-        """descendantセレクタにマッチし、かつ祖先にancestorセレクタにマッチするノードがある場合Trueを返す"""
         if not self.descendant.matches(node): return False
         while node.parent:
             if self.ancestor.matches(node.parent): return True
             node = node.parent
         return False
 
+
+# ============================================================
+# インラインレイアウトクラス群
+# ============================================================
 class LineLayout:
-    """インラインモードの1行分を表すレイアウトオブジェクト。
-    子要素としてTextLayoutを持ち、ベースライン揃えで単語を配置する。"""
+    """インラインモードの1行分"""
 
     def __init__(self, node, parent, previous):
-        self.node = node          # 対応するHTMLノード
-        self.parent = parent      # 親BlockLayout
-        self.previous = previous  # 直前の行（y座標計算に使用）
-        self.children = []        # この行に含まれるTextLayoutのリスト
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
 
     def layout(self):
-        """行の座標・高さを確定する。各単語のy座標をベースライン基準で揃える。"""
         self.width = self.parent.width
         self.x = self.parent.x
 
-        # y座標: 前の行の直後、または親の先頭
         if self.previous:
             self.y = self.previous.y + self.previous.height
         else:
             self.y = self.parent.y
 
-        # 各単語（TextLayout）のレイアウトを確定
         for word in self.children:
             word.layout()
 
-        # 空行の場合は高さ0で終了
         if not self.children:
             self.height = 0
             return
 
-        # ベースライン揃え: 全単語のascentの最大値を基準にy座標を調整
-        max_ascent = max([word.font.metrics("ascent") for word in self.children])
+        # ベースライン揃え（Skia版: linespace/ascentを使用）
+        max_ascent = max([-word.font.getMetrics().fAscent
+                          for word in self.children])
         baseline = self.y + 1.25 * max_ascent
         for word in self.children:
-            word.y = baseline - word.font.metrics("ascent")
-        max_descent = max([word.font.metrics("descent") for word in self.children])
+            word.y = baseline + word.font.getMetrics().fAscent
+        max_descent = max([word.font.getMetrics().fDescent
+                           for word in self.children])
         self.height = 1.25 * (max_ascent + max_descent)
 
     def paint(self):
-        # 行自体は描画コマンドを持たない（子のTextLayoutが描画を担当）
         return []
+
+    def paint_effects(self, cmds):
+        return cmds
 
     def should_paint(self):
         return True
 
 
 class TextLayout:
-    """1単語分のレイアウトオブジェクト。フォント・座標・サイズを計算し、
-    DrawTextコマンドを生成する最小描画単位。"""
+    """1単語分のレイアウトオブジェクト"""
 
     def __init__(self, node, word, parent, previous):
-        self.node = node          # 対応するHTMLテキストノード
-        self.word = word          # この単語の文字列
-        self.children = []        # 葉ノードのため常に空
-        self.parent = parent      # 親LineLayout
-        self.previous = previous  # 同じ行内の直前の単語（x座標計算に使用）
+        self.node = node
+        self.word = word
+        self.children = []
+        self.parent = parent
+        self.previous = previous
 
     def layout(self):
-        """フォントを決定し、x座標・幅・高さを計算する。
-        y座標はLineLayout.layout()でベースライン揃え後に設定される。"""
         weight = self.node.style["font-weight"]
         style = self.node.style["font-style"]
-        if style == "normal": style = "roman"  # tkinterでは"roman"が通常体
-        size = int(float(self.node.style["font-size"][:-2]) * .75)  # px→pt変換（概算）
+        if style == "normal": style = "roman"
+        size = int(float(self.node.style["font-size"][:-2]) * .75)
         self.font = get_font(size, weight, style)
 
-        self.width = self.font.measure(self.word)
+        self.width = font_measureText(self.font, self.word)
 
-        # x座標: 前の単語の右端＋スペース幅、なければ行の先頭
         if self.previous:
-            space = self.previous.font.measure(" ")
+            space = font_measureText(self.previous.font, " ")
             self.x = self.previous.x + space + self.previous.width
         else:
             self.x = self.parent.x
 
-        self.height = self.font.metrics("linespace")
+        self.height = linespace(self.font)
 
     def paint(self):
-        """この単語のDrawTextコマンドを返す"""
         color = self.node.style["color"]
         return [DrawText(self.x, self.y, self.word, self.font, color)]
+
+    def paint_effects(self, cmds):
+        return cmds
 
     def should_paint(self):
         return True
@@ -788,45 +896,40 @@ INPUT_WIDTH_PX = 200
 
 
 class InputLayout:
-    """<input>/<button> 要素のインラインレイアウトオブジェクト。
-    TextLayoutと同じくインライン行（LineLayout）の子として配置される。
-    固定幅（INPUT_WIDTH_PX）で描画し、フォーカス時はカーソルを表示する。"""
+    """<input>/<button> 要素のインラインレイアウト"""
 
     def __init__(self, node, parent, previous):
-        self.node = node          # 対応するHTMLノード（inputまたはbutton要素）
-        self.parent = parent      # 親LineLayout
-        self.previous = previous  # 同じ行内の直前の要素（x座標計算に使用）
-        self.children = []        # 葉ノードのため常に空
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
 
     def layout(self):
-        """フォントを決定し、x座標・幅・高さを計算する。
-        幅はINPUT_WIDTH_PX固定で、x座標は前の要素の右端から計算する。"""
         weight = self.node.style["font-weight"]
         style = self.node.style["font-style"]
         if style == "normal": style = "roman"
         size = int(float(self.node.style["font-size"][:-2]) * .75)
         self.font = get_font(size, weight, style)
 
-        self.width = INPUT_WIDTH_PX  # 入力欄は固定幅
+        self.width = INPUT_WIDTH_PX
 
-        # x座標: 前の要素の右端＋スペース幅、なければ行の先頭
         if self.previous:
-            space = self.previous.font.measure(" ")
+            space = font_measureText(self.previous.font, " ")
             self.x = self.previous.x + space + self.previous.width
         else:
             self.x = self.parent.x
 
-        self.height = self.font.metrics("linespace")
+        self.height = linespace(self.font)
 
     def should_paint(self):
         return True
 
     def self_rect(self):
-        return Rect(self.x, self.y,
-                    self.x + self.width, self.y + self.height)
+        return skia.Rect.MakeLTRB(
+            self.x, self.y,
+            self.x + self.width, self.y + self.height)
 
     def paint(self):
-        """入力欄の背景・テキスト・フォーカスカーソルの描画コマンドを返す"""
         cmds = []
         bgcolor = self.node.style.get("background-color", "transparent")
         if bgcolor != "transparent":
@@ -834,7 +937,6 @@ class InputLayout:
                             self.x + self.width, self.y + self.height, bgcolor)
             cmds.append(rect)
 
-        # 表示テキスト: inputはvalue属性、buttonは子テキストノードから取得
         if self.node.tag == "input":
             text = self.node.attributes.get("value", "")
         elif self.node.tag == "button":
@@ -848,39 +950,40 @@ class InputLayout:
         color = self.node.style["color"]
         cmds.append(DrawText(self.x, self.y, text, self.font, color))
 
-        # フォーカス時: テキスト末尾にカーソル（縦線）を描画
         if self.node.is_focused:
-            cx = self.x + self.font.measure(text)
+            cx = self.x + font_measureText(self.font, text)
             cmds.append(DrawLine(cx, self.y, cx, self.y + self.height, "black", 1))
 
         return cmds
 
+    def paint_effects(self, cmds):
+        cmds = paint_visual_effects(self.node, cmds, self.self_rect())
+        return cmds
+
+
+# ============================================================
+# スタイル適用
+# ============================================================
 def style(node, rules):
-    """CSSルールと継承プロパティをノードに適用し、子ノードへ再帰する。
-    適用優先順: 継承値 → CSSルール → style属性（インラインスタイル）"""
     node.style = {}
 
-    # 継承: 親のスタイルを引き継ぐ（なければデフォルト値を使う）
     for property, default_value in INHERITED_PROPERTIES.items():
         if node.parent:
             node.style[property] = node.parent.style[property]
         else:
             node.style[property] = default_value
 
-    # CSSルールを適用（Elementノードのみ。Textノードはセレクタにマッチしない）
     if isinstance(node, Element):
         for selector, body in rules:
             if not selector.matches(node): continue
             for property, value in body.items():
                 node.style[property] = value
 
-        # style属性を適用（CSSルールより優先）
         if "style" in node.attributes:
             pairs = CSSParser(node.attributes["style"]).body()
             for property, value in pairs.items():
                 node.style[property] = value
 
-    # font-size のパーセンテージを絶対ピクセル値に解決する
     if node.style["font-size"].endswith("%"):
         if node.parent:
             parent_font_size = node.parent.style["font-size"]
@@ -895,22 +998,29 @@ def style(node, rules):
 
 
 def print_tree(node, indent=0):
-    """HTMLツリーをインデント付きで標準出力に表示する（デバッグ用）"""
     print(" " * indent, node)
     for child in node.children:
         print_tree(child, indent + 2)
 
 
 def paint_tree(layout_object, display_list):
-    """レイアウトツリーを深さ優先で走査し、全描画コマンドをdisplay_listに収集する"""
+    """レイアウトツリーを走査し、描画コマンドをツリー構造でdisplay_listに収集する。
+    paint_effects()でビジュアルエフェクト（opacity, blend等）を各ノードに適用する。"""
     if layout_object.should_paint():
-        display_list.extend(layout_object.paint())
+        cmds = layout_object.paint()
+    else:
+        cmds = []
+
     for child in layout_object.children:
-        paint_tree(child, display_list)
+        paint_tree(child, cmds)
+
+    if layout_object.should_paint():
+        cmds = layout_object.paint_effects(cmds)
+
+    display_list.extend(cmds)
 
 
 def tree_to_list(tree, result):
-    """ツリーを深さ優先でフラットなリストに変換して返す（CSSリンク収集などに使用）"""
     result.append(tree)
     for child in tree.children:
         tree_to_list(child, result)
@@ -918,63 +1028,48 @@ def tree_to_list(tree, result):
 
 
 def cascade_priority(rule):
-    """CSSルールのカスケード優先度（セレクタの詳細度）を返す。sorted()のkeyに使用する。"""
     selector, body = rule
     return selector.priority
 
 
-# ブラウザのデフォルトスタイルシート（browser.cssから読み込み、起動時に1回だけパース）
+# ============================================================
+# デフォルトスタイルシートとJSランタイム
+# ============================================================
 DEFAULT_STYLE_SHEET = CSSParser(open("browser.css", encoding="utf-8").read()).parse()
 
 RUNTIME_JS = open("runtime.js", encoding="utf-8").read()
 
-# JSからPython側でイベントを発火する際に evaljs で実行するコード断片。
-# dukpy.handle / dukpy.type は evaljs のキーワード引数で注入される。
 EVENT_DISPATCH_JS = \
     "new Node(dukpy.handle).dispatchEvent(new Event(dukpy.type))"
 
 class JSContext:
-    """JavaScriptの実行環境を管理するクラス。
-    DukPy の JSInterpreter をラップし、Python関数のエクスポートや
-    DOM操作APIの橋渡しを担う。"""
-
     def __init__(self, tab):
         self.tab = tab
         self.interp = dukpy.JSInterpreter()
 
-        # Python関数を JS の call_python() から呼び出せるようにエクスポート。
-        # evaljs(RUNTIME_JS) より先に登録しておく必要がある。
         self.interp.export_function("log", print)
         self.interp.export_function("querySelectorAll", self.querySelectorAll)
         self.interp.export_function("getAttribute", self.getAttribute)
         self.interp.export_function("innerHTML_set", self.innerHTML_set)
 
-        # ユーザースクリプトより先にランタイムを読み込む。
-        # console, document, Node, Event などのグローバルオブジェクトを定義する。
         self.interp.evaljs(RUNTIME_JS)
 
-        # PythonのElementオブジェクトをJSに直接渡せないため、
-        # 整数のハンドル（ファイルディスクリプタと同じ発想）で間接参照する。
-        self.node_to_handle = {}  # Element -> int
-        self.handle_to_node = {}  # int -> Element
+        self.node_to_handle = {}
+        self.handle_to_node = {}
 
     def run(self, script, code):
-        """JavaScriptコードを実行する。クラッシュしてもブラウザを落とさない。"""
         try:
             return self.interp.evaljs(code)
         except dukpy.JSRuntimeError as e:
             print("Script", script, "crashed", e)
 
     def querySelectorAll(self, selector_text):
-        """CSSセレクタにマッチする全ノードのハンドルリストを返す。
-        JSには Element オブジェクトを直接渡せないためハンドルに変換する。"""
         selector = CSSParser(selector_text).selector()
         nodes = [node for node in tree_to_list(self.tab.nodes, [])
                  if selector.matches(node)]
         return [self.get_handle(node) for node in nodes]
 
     def get_handle(self, elt):
-        """ElementオブジェクトのハンドルIDを返す。未登録なら新規発行する。"""
         if elt not in self.node_to_handle:
             handle = len(self.node_to_handle)
             self.node_to_handle[elt] = handle
@@ -984,15 +1079,11 @@ class JSContext:
         return handle
 
     def getAttribute(self, handle, attr):
-        """ハンドルで指定した要素の属性値を返す。属性がなければ空文字を返す。"""
         elt = self.handle_to_node[handle]
         attr = elt.attributes.get(attr, None)
         return attr if attr else ""
 
     def dispatch_event(self, type, elt):
-        """指定要素にイベントを発火し、preventDefault が呼ばれたかを返す。
-        まだハンドルがない要素（リスナーゼロ）には -1 を渡す。
-        戻り値が True の場合、呼び出し元はデフォルト動作をスキップする。"""
         handle = self.node_to_handle.get(elt, -1)
         do_default = self.interp.evaljs(
             EVENT_DISPATCH_JS, type=type, handle=handle
@@ -1000,9 +1091,6 @@ class JSContext:
         return not do_default
 
     def innerHTML_set(self, handle, s):
-        """ハンドルで指定した要素の子ノードをHTML文字列で置き換える。
-        HTMLパーサーはドキュメント全体用のため <html><body> でラップしてパースする。
-        DOM変更後は render() を呼んでレイアウト・描画を更新する。"""
         doc = HTMLParser("<html><body>" + s + "</body></html>").parse()
         new_nodes = doc.children[0].children
         elt = self.handle_to_node[handle]
@@ -1010,11 +1098,8 @@ class JSContext:
         for child in elt.children:
             child.parent = elt
         self.tab.render()
-    
+
     def XMLHttpRequest_send(self, method, url, body):
-        """JSのXMLHttpRequest.send()から呼ばれるPython側の実装。
-        CSP違反またはクロスオリジンXHRの場合は例外を送出してJSに伝える。
-        同期XHRのみ対応（runtime.jsでis_async=trueは拒否している）。"""
         full_url = self.tab.url.resolve(url)
         if not self.tab.allowed_request(full_url):
             raise Exception("Cross-origin XHR blocked by CSP")
@@ -1023,10 +1108,33 @@ class JSContext:
         headers, out = full_url.request(self.tab.url, body)
         return out
 
-class Tab:
-    """ブラウザのメインクラス。ウィンドウ・キャンバス・スクロール状態を管理し、
-    URLの読み込みからレンダリングまでのパイプラインを統括する。"""
 
+# ============================================================
+# Rect ユーティリティ（Chrome UI のヒットテスト用）
+# ============================================================
+class Rect:
+    """矩形領域を表すユーティリティクラス。Chrome UIのヒットテスト等に使用。
+    skia.Rectとは別に、整数座標ベースのUIレイアウト用に残す。"""
+
+    def __init__(self, left, top, right, bottom):
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+
+    def contains_point(self, x, y):
+        return x >= self.left and x < self.right \
+            and y >= self.top and y < self.bottom
+
+    def to_skia(self):
+        """skia.Rectに変換する"""
+        return skia.Rect.MakeLTRB(self.left, self.top, self.right, self.bottom)
+
+
+# ============================================================
+# Tab クラス
+# ============================================================
+class Tab:
     def __init__(self, tab_height):
         self.url = None
         self.scroll = 0
@@ -1037,7 +1145,6 @@ class Tab:
         self.focus = None
 
     def load(self, url, payload=None):
-        """URLからHTMLを取得し、パース・スタイル適用・レイアウト・描画を行う"""
         self.history.append(url)
         self.url = url
         headers, body = url.request(None, payload)
@@ -1055,7 +1162,7 @@ class Tab:
                    if isinstance(node, Element)
                    and node.tag == "script"
                    and "src" in node.attributes]
-        
+
         self.js = JSContext(self)
         for script in scripts:
             script_url = url.resolve(script)
@@ -1068,10 +1175,8 @@ class Tab:
                 continue
             self.js.run(script, body)
 
-        # ① デフォルトスタイルシートを起点にルールを集める
         self.rules = DEFAULT_STYLE_SHEET.copy()
 
-        # ② <link rel=stylesheet> のCSSファイルをすべて収集して追加
         links = [node.attributes["href"]
                  for node in tree_to_list(self.nodes, [])
                  if isinstance(node, Element)
@@ -1091,51 +1196,32 @@ class Tab:
 
         self.render()
 
-    
     def render(self):
-        # ③ ルールが全部揃ってから1回だけ style() を適用
         style(self.nodes, sorted(self.rules, key=cascade_priority))
-
-        # ④ style() 完了後にレイアウトを計算（word() 内で node.style を参照するため）
         self.document = DocumentLayout(self.nodes)
         self.document.layout()
-
         self.display_list = []
         paint_tree(self.document, self.display_list)
 
-
-    def draw(self, canvas, offset):
-        """display_listの描画コマンドをキャンバスに描画する。
-        現在のビューポート（scroll〜scroll+HEIGHT）外のコマンドはスキップして高速化する。"""
-        for cmd in self.display_list:
-            if cmd.top > self.scroll + self.tab_height: continue  # 画面下より下は描画しない
-            if cmd.bottom < self.scroll: continue        # 画面上より上は描画しない
-            cmd.execute(self.scroll - offset, canvas)
-
     def scrolldown(self):
-        """スクロール位置を1ステップ下へ更新する。ページ末尾を超えないようにクランプする。"""
         max_y = max(
             self.document.height + 2*VSTEP - self.tab_height, 0)
         self.scroll = min(self.scroll + SCROLL_STEP, max_y)
 
     def click(self, x, y):
-        """クリック座標にあるレイアウトオブジェクトを特定し、
-        リンク（<a>タグ）であればそのhrefを読み込む。"""
         self.focus = None
-        y += self.scroll  # スクロールを考慮した絶対座標に変換
+        y += self.scroll
 
-        # クリック座標に重なるレイアウトオブジェクトを収集（最前面=末尾）
         objs = [obj for obj in tree_to_list(self.document, [])
                 if obj.x <= x < obj.x + obj.width
                 and obj.y <= y < obj.y + obj.height]
 
         if not objs: return
-        elt = objs[-1].node  # 最も深い（最前面の）要素のDOMノード
+        elt = objs[-1].node
 
         if self.focus:
             self.focus.is_focused = False
 
-        # DOMツリーを親方向にたどり、対応する要素を探す
         while elt:
             if isinstance(elt, Text):
                 pass
@@ -1159,31 +1245,24 @@ class Tab:
             elt = elt.parent
 
     def go_back(self):
-        """履歴を1つ戻る。現在のURLをpopし、その前のURLを再読み込みする。"""
         if len(self.history) > 1:
-            self.history.pop()       # 現在のURLを破棄
-            back = self.history.pop() # 戻り先URL（load()で再追加される）
+            self.history.pop()
+            back = self.history.pop()
             self.load(back)
-    
+
     def keypress(self, char):
-        """フォーカス中の<input>要素に文字を追記し、JSのkeydownイベントを発火する。
-        preventDefault()が呼ばれた場合はデフォルト動作（文字追記）をスキップする。"""
         if self.focus:
             if self.js.dispatch_event("keydown", self.focus): return
             self.focus.attributes["value"] += char
             self.render()
 
     def submit_form(self, elt):
-        """フォームの<input>要素を収集してURLエンコードし、POSTリクエストを送信する。
-        JSのsubmitイベントでpreventDefault()が呼ばれた場合はスキップする。"""
         if self.js.dispatch_event("submit", elt): return
-        # フォーム内の全<input name=...>要素を収集
         inputs = [node for node in tree_to_list(elt, [])
                   if isinstance(node, Element)
                   and node.tag == "input"
                   and "name" in node.attributes]
 
-        # name=value をURLエンコードして "&" で連結（先頭の "&" を除去）
         body = ""
         for input in inputs:
             name = input.attributes["name"]
@@ -1197,134 +1276,72 @@ class Tab:
         self.load(url, body)
 
     def allowed_request(self, url):
-        """CSP（Content-Security-Policy）の allowed_origins リストに基づき、
-        指定URLへのリクエストが許可されているか判定する。
-        CSPヘッダーが未設定（allowed_origins == None）の場合はすべて許可する。"""
         return self.allowed_origins == None or \
             url.origin() in self.allowed_origins
 
-class Rect:
-    """矩形領域を表すユーティリティクラス。UI要素のヒットテストなどに使用する。"""
 
-    def __init__(self, left, top, right, bottom):
-        self.left = left
-        self.top = top
-        self.right = right
-        self.bottom = bottom
-
-    def contains_point(self, x, y):
-        """座標(x, y)がこの矩形内に含まれるかを判定する"""
-        return x >= self.left and x < self.right \
-            and y >= self.top and y < self.bottom
-
-
-class DrawOutline:
-    """矩形の枠線描画コマンド。ボタンやアドレスバーの枠に使用する。"""
-
-    def __init__(self, rect, color, thickness):
-        self.rect = rect
-        self.color = color
-        self.thickness = thickness
-
-    def execute(self, scroll, canvas):
-        """スクロール量を考慮して枠線を描画する"""
-        canvas.create_rectangle(
-            self.rect.left, self.rect.top - scroll,
-            self.rect.right, self.rect.bottom - scroll,
-            width=self.thickness,
-            outline=self.color
-        )
-
-
-class DrawLine:
-    """直線描画コマンド。タブ区切り線やアドレスバーのカーソルなどに使用する。"""
-
-    def __init__(self, x1, y1, x2, y2, color, thickness):
-        self.rect = Rect(x1, y1, x2, y2)  # 始点(left,top)〜終点(right,bottom)
-        self.color = color
-        self.thickness = thickness
-        self.top = y1
-        self.bottom = y2
-
-    def execute(self, scroll, canvas):
-        """スクロール量を考慮して直線を描画する"""
-        canvas.create_line(
-            self.rect.left, self.rect.top - scroll,
-            self.rect.right, self.rect.bottom - scroll,
-            fill=self.color, width=self.thickness)
-
+# ============================================================
+# Chrome クラス（ブラウザUI）
+# ============================================================
 class Chrome:
-    """ブラウザのUI部分（タブバー・アドレスバー・戻るボタン）を管理する。
-    描画コマンドの生成とクリック・キー入力のハンドリングを担当する。"""
-
     def __init__(self, browser):
         self.browser = browser
         self.font = get_font(20, "normal", "roman")
-        self.font_height = self.font.metrics("linespace")
+        self.font_height = linespace(self.font)
         self.padding = 5
 
-        # --- タブバー領域の計算 ---
         self.tabbar_top = 0
         self.tabbar_bottom = self.font_height + 2*self.padding
 
-        # 新規タブボタン「+」の領域
-        plus_width = self.font.measure("+") + 2*self.padding
+        plus_width = font_measureText(self.font, "+") + 2*self.padding
         self.newtab_rect = Rect(
             self.padding, self.padding,
             self.padding + plus_width,
             self.padding + self.font_height
         )
 
-        # --- URLバー領域の計算 ---
         self.bottom = self.tabbar_bottom
         self.urlbar_top = self.tabbar_bottom
         self.urlbar_bottom = self.urlbar_top + \
             self.font_height + 2*self.padding
-        self.bottom = self.urlbar_bottom  # Chrome全体の下端
+        self.bottom = self.urlbar_bottom
 
-        # 戻るボタン「<」の領域
-        back_width = self.font.measure("<") + 2*self.padding
+        back_width = font_measureText(self.font, "<") + 2*self.padding
         self.back_rect = Rect(
             self.padding,
             self.urlbar_top + self.padding,
             self.padding + back_width,
             self.urlbar_bottom - self.padding)
 
-        # アドレスバーの領域（戻るボタンの右端〜ウィンドウ右端）
         self.address_rect = Rect(
             self.back_rect.right + self.padding,
             self.urlbar_top + self.padding,
             WIDTH - self.padding,
             self.urlbar_bottom - self.padding)
 
-        self.focus = None        # 現在フォーカスがある要素（"address bar" or None）
-        self.address_bar = ""    # アドレスバーに入力中のテキスト
+        self.focus = None
+        self.address_bar = ""
 
     def tab_rect(self, i):
-        """i番目のタブの矩形領域を計算して返す"""
         tabs_start = self.newtab_rect.right + self.padding
-        tab_width = self.font.measure("Tab X") + 2*self.padding
+        tab_width = font_measureText(self.font, "Tab X") + 2*self.padding
         return Rect(
             tabs_start + tab_width * i, self.tabbar_top,
             tabs_start + tab_width * (i + 1), self.tabbar_bottom
         )
 
     def paint(self):
-        """Chrome部分の描画コマンドリストを生成する"""
         cmds = []
 
-        # Chrome背景（白で塗りつぶしてページコンテンツを隠す）
         cmds.append(DrawRect(0, 0, WIDTH, self.bottom, "white"))
 
-        # 新規タブボタン「+」
-        cmds.append(DrawOutline(self.newtab_rect, "black", 1))
+        cmds.append(DrawOutline(self.newtab_rect.to_skia(), "black", 1))
         cmds.append(DrawText(
             self.newtab_rect.left + self.padding,
             self.newtab_rect.top,
             "+", self.font, "black"
         ))
 
-        # 各タブの描画（左右の縦線・ラベル・アクティブタブの下線）
         for i, tab in enumerate(self.browser.tabs):
             bounds = self.tab_rect(i)
             cmds.append(DrawLine(
@@ -1337,7 +1354,6 @@ class Chrome:
                 bounds.left + self.padding, bounds.top + self.padding,
                 "Tab {}".format(i), self.font, "black"))
 
-            # アクティブタブはタブ以外の領域に下線を引く（タブが前面に出ている表現）
             if tab == self.browser.active_tab:
                 cmds.append(DrawLine(
                     0, bounds.bottom, bounds.left, bounds.bottom,
@@ -1346,27 +1362,23 @@ class Chrome:
                     bounds.right, bounds.bottom, WIDTH, bounds.bottom,
                     "black", 1))
 
-        # タブバーとURLバーの境界線
         cmds.append(DrawLine(
             0, self.bottom, WIDTH,
             self.bottom, "black", 1))
 
-        # 戻るボタン「<」
-        cmds.append(DrawOutline(self.back_rect, "black", 1))
+        cmds.append(DrawOutline(self.back_rect.to_skia(), "black", 1))
         cmds.append(DrawText(
             self.back_rect.left + self.padding,
             self.back_rect.top,
             "<", self.font, "black"))
 
-        # アドレスバー
-        cmds.append(DrawOutline(self.address_rect, "black", 1))
+        cmds.append(DrawOutline(self.address_rect.to_skia(), "black", 1))
 
         if self.focus == "address bar":
-            # 入力中: 入力テキストとカーソル（赤い縦線）を表示
             cmds.append(DrawText(self.address_rect.left + self.padding,
                                  self.address_rect.top,
                                  self.address_bar, self.font, "black"))
-            w = self.font.measure(self.address_bar)
+            w = font_measureText(self.font, self.address_bar)
             cmds.append(DrawLine(
                 self.address_rect.left + self.padding + w,
                 self.address_rect.top,
@@ -1374,7 +1386,6 @@ class Chrome:
                 self.address_rect.bottom,
                 "red", 1))
         else:
-            # 非フォーカス時: 現在のURLを表示
             url = str(self.browser.active_tab.url)
             cmds.append(DrawText(
                 self.address_rect.left + self.padding,
@@ -1383,8 +1394,6 @@ class Chrome:
         return cmds
 
     def click(self, x, y):
-        """Chrome領域のクリックイベントを処理する。
-        クリック位置に応じて新規タブ・戻る・アドレスバーフォーカス・タブ切替を行う。"""
         self.focus = None
         if self.newtab_rect.contains_point(x, y):
             self.browser.new_tab(URL("https://browser.engineering/"))
@@ -1394,107 +1403,189 @@ class Chrome:
             self.focus = "address bar"
             self.address_bar = ""
         else:
-            # タブバーのクリック: クリックされたタブをアクティブにする
             for i, tab in enumerate(self.browser.tabs):
                 if self.tab_rect(i).contains_point(x, y):
                     self.browser.active_tab = tab
                     break
 
     def blur(self):
-        """Chromeのフォーカスを解除する"""
         self.focus = None
 
     def keypress(self, char):
-        """アドレスバーにフォーカスがある場合、入力文字を追加する"""
         if self.focus == "address bar":
             self.address_bar += char
             return True
         return False
 
     def enter(self):
-        """アドレスバーにフォーカスがある場合、入力URLを読み込む"""
         if self.focus == "address bar":
             self.browser.active_tab.load(URL(self.address_bar))
             self.focus = None
 
+
+# ============================================================
+# Browser クラス（トップレベル・SDL/Skia版）
+# ============================================================
+
+# SDL_CreateRGBSurfaceFromに渡すマスク値（RGBA各チャンネルの位置を指定）
+RED_MASK = 0x000000ff
+GREEN_MASK = 0x0000ff00
+BLUE_MASK = 0x00ff0000
+ALPHA_MASK = 0xff000000
+
+
 class Browser:
-    """ブラウザのトップレベルクラス。tkinterウィンドウの管理、タブの管理、
-    イベントハンドリング（キー入力・マウスクリック）を統括する。"""
+    """ブラウザのトップレベルクラス。SDLウィンドウの管理、Skiaサーフェスの管理、
+    タブ管理、イベントハンドリングを統括する。"""
 
     def __init__(self):
-        self.tabs = []          # 開いているタブのリスト
-        self.active_tab = None  # 現在表示中のタブ
+        self.tabs = []
+        self.active_tab = None
 
-        # tkinterウィンドウとキャンバスを初期化
-        self.window = tkinter.Tk()
-        self.canvas = tkinter.Canvas(
-            self.window,
-            width=WIDTH,
-            height=HEIGHT,
-            bg="white"
-        )
-        self.canvas.pack()
-        self.scroll = 0  # 現在のスクロール位置（ピクセル）
+        # SDLの初期化とウィンドウ作成
+        sdl2.SDL_Init(sdl2.SDL_INIT_EVENTS)
+        self.sdl_window = sdl2.SDL_CreateWindow(
+            b"Browser",
+            sdl2.SDL_WINDOWPOS_CENTERED,
+            sdl2.SDL_WINDOWPOS_CENTERED,
+            WIDTH, HEIGHT,
+            sdl2.SDL_WINDOW_SHOWN)
 
-        # イベントバインド
-        self.window.bind("<Down>", self.handle_down)      # ↓キー: スクロール
-        self.window.bind("<Button-1>", self.handle_click)  # 左クリック
+        # Skiaのルートサーフェス（最終合成結果をここに描画しSDLへコピー）
+        self.root_surface = skia.Surface.MakeRaster(
+            skia.ImageInfo.Make(
+                WIDTH, HEIGHT,
+                ct=skia.kRGBA_8888_ColorType,
+                at=skia.kUnpremul_AlphaType))
+
+        # ChromeとTabのサーフェスを初期化
         self.chrome = Chrome(self)
-        self.window.bind("<Key>", self.handle_key)         # キー入力: アドレスバーへ
-        self.window.bind("<Return>", self.handle_enter)    # Enterキー: URL確定
+        self.chrome_surface = skia.Surface(WIDTH, math.ceil(self.chrome.bottom))
+        self.tab_surface = None
 
-    def handle_down(self, e):
-        """↓キー押下時: アクティブタブをスクロールして再描画"""
-        self.active_tab.scrolldown()
-        self.draw()
+    def raster_tab(self):
+        """タブのコンテンツをtab_surfaceにラスタライズ（描画）する"""
+        tab = self.active_tab
+        tab_height = math.ceil(tab.document.height + 2*VSTEP)
+        if self.tab_surface is None or \
+           self.tab_surface.width() != WIDTH or \
+           self.tab_surface.height() != tab_height:
+            self.tab_surface = skia.Surface(WIDTH, tab_height)
 
-    def handle_click(self, e):
-        """クリック時: Chrome領域ならChromeに、それ以外はタブのコンテンツに委譲"""
-        if e.y < self.chrome.bottom:
-            self.focus = None
-            self.chrome.click(e.x, e.y)
-        else:
-            self.focus = "content"
-            self.chrome.blur()
-            tab_y = e.y - self.chrome.bottom  # Chrome分のオフセットを引く
-            self.active_tab.click(e.x, tab_y)
-        self.draw()
+        canvas = self.tab_surface.getCanvas()
+        canvas.clear(skia.ColorWHITE)
+        for cmd in tab.display_list:
+            cmd.execute(canvas)
+
+    def raster_chrome(self):
+        """Chrome UIをchrome_surfaceにラスタライズする"""
+        canvas = self.chrome_surface.getCanvas()
+        canvas.clear(skia.ColorWHITE)
+        for cmd in self.chrome.paint():
+            cmd.execute(canvas)
 
     def draw(self):
-        """キャンバスを全消去し、タブのコンテンツとChromeを重ねて描画する"""
-        self.canvas.delete("all")
-        self.active_tab.draw(self.canvas, self.chrome.bottom)
+        """tab_surfaceとchrome_surfaceをroot_surfaceに合成し、SDLウィンドウへコピーする"""
+        canvas = self.root_surface.getCanvas()
+        canvas.clear(skia.ColorWHITE)
 
-        # Chromeはスクロールなし（scroll=0）で最前面に描画
-        for cmd in self.chrome.paint():
-            cmd.execute(0, self.canvas)
+        # タブコンテンツをクリップして適切な位置に描画
+        tab_rect = skia.Rect.MakeLTRB(0, self.chrome.bottom, WIDTH, HEIGHT)
+        tab_offset = self.chrome.bottom - self.active_tab.scroll
+        canvas.save()
+        canvas.clipRect(tab_rect)
+        if self.tab_surface:
+            self.tab_surface.draw(canvas, 0, tab_offset)
+        canvas.restore()
+
+        # Chrome UIを上に重ねて描画
+        chrome_rect = skia.Rect.MakeLTRB(0, 0, WIDTH, self.chrome.bottom)
+        canvas.save()
+        canvas.clipRect(chrome_rect)
+        self.chrome_surface.draw(canvas, 0, 0)
+        canvas.restore()
+
+        # SkiaサーフェスのピクセルをSDLウィンドウにコピー
+        skia_image = self.root_surface.makeImageSnapshot()
+        skia_bytes = skia_image.tobytes()
+
+        depth = 32
+        pitch = 4 * WIDTH
+        sdl_surface = sdl2.SDL_CreateRGBSurfaceFrom(
+            skia_bytes, WIDTH, HEIGHT, depth, pitch,
+            RED_MASK, GREEN_MASK, BLUE_MASK, ALPHA_MASK)
+
+        rect = sdl2.SDL_Rect(0, 0, WIDTH, HEIGHT)
+        window_surface = sdl2.SDL_GetWindowSurface(self.sdl_window)
+        sdl2.SDL_BlitSurface(sdl_surface, rect, window_surface, rect)
+        sdl2.SDL_UpdateWindowSurface(self.sdl_window)
 
     def new_tab(self, url):
-        """新しいタブを作成してURLを読み込み、アクティブにする"""
         new_tab = Tab(HEIGHT - self.chrome.bottom)
         new_tab.load(url)
         self.active_tab = new_tab
         self.tabs.append(new_tab)
+        self.raster_tab()
+        self.raster_chrome()
         self.draw()
 
-    def handle_key(self, e):
-        """印字可能文字の入力をChromeに転送する（アドレスバー入力用）"""
-        if len(e.char) == 0: return
-        if not (0x20 <= ord(e.char) < 0x7f): return  # 印字可能ASCII文字のみ
-        if self.chrome.keypress(e.char):
+    def handle_quit(self):
+        pass
+
+    def handle_down(self):
+        self.active_tab.scrolldown()
+        self.draw()
+
+    def handle_click(self, e):
+        if e.y < self.chrome.bottom:
+            self.chrome.focus = None
+            self.chrome.click(e.x, e.y)
+            self.raster_chrome()
+        else:
+            self.chrome.blur()
+            tab_y = e.y - self.chrome.bottom + self.active_tab.scroll
+            self.active_tab.click(e.x - HSTEP, tab_y)
+            self.raster_tab()
+        self.draw()
+
+    def handle_key(self, char):
+        if self.chrome.keypress(char):
+            self.raster_chrome()
             self.draw()
-        elif self.focus == "content":
-            self.active_tab.keypress(e.char)
+        else:
+            self.active_tab.keypress(char)
+            self.raster_tab()
             self.draw()
 
-    def handle_enter(self, e):
-        """Enterキー押下時: アドレスバーのURL確定をChromeに委譲"""
+    def handle_enter(self):
         self.chrome.enter()
+        self.raster_tab()
+        self.raster_chrome()
         self.draw()
-    
+
+
+def mainloop(browser):
+    """SDLのイベントループ。Tkinterのmainloop()に相当する。
+    各イベントを適切なハンドラに振り分ける。"""
+    event = sdl2.SDL_Event()
+    while True:
+        while sdl2.SDL_PollEvent(ctypes.byref(event)) != 0:
+            if event.type == sdl2.SDL_QUIT:
+                browser.handle_quit()
+                sdl2.SDL_Quit()
+                sys.exit()
+            elif event.type == sdl2.SDL_MOUSEBUTTONUP:
+                browser.handle_click(event.button)
+            elif event.type == sdl2.SDL_KEYDOWN:
+                if event.key.keysym.sym == sdl2.SDLK_RETURN:
+                    browser.handle_enter()
+                elif event.key.keysym.sym == sdl2.SDLK_DOWN:
+                    browser.handle_down()
+            elif event.type == sdl2.SDL_TEXTINPUT:
+                browser.handle_key(event.text.text.decode('utf8'))
+
 
 if __name__ == "__main__":
-    import sys
-    # コマンドライン引数のURLで新規タブを開き、tkinterイベントループを開始
-    Browser().new_tab(URL(sys.argv[1]))
-    tkinter.mainloop()
+    browser = Browser()
+    browser.new_tab(URL(sys.argv[1]))
+    mainloop(browser)
